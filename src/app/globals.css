@@ -1,0 +1,89 @@
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-sans: "Space Grotesk";
+  --font-mono: "JetBrains Mono";
+}
+
+html,
+body {
+  background: #0b0f14;
+  color: #e6edf3;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Financial figures always read in the ledger mono face with tabular numerals. */
+.figure {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+.eyebrow {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 0.6875rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: #5b6673;
+}
+
+.hairline {
+  border-color: #1e2833;
+}
+
+/* Focus visibility for keyboard users */
+:focus-visible {
+  outline: 2px solid #38e1b0;
+  outline-offset: 2px;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: #1e2833;
+  border-radius: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* Form inputs */
+.input {
+  width: 100%;
+  border-radius: 0.5rem;
+  border: 1px solid #1e2833;
+  background: #111820;
+  padding: 0.5rem 0.75rem;
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 0.8125rem;
+  color: #e6edf3;
+  outline: none;
+}
+.input:focus {
+  border-color: #38e1b0;
+}
+.input::placeholder {
+  color: #3d4a59;
+}
+select.input {
+  appearance: none;
+  cursor: pointer;
+}
+
+.grid-noise {
+  background-image: radial-gradient(circle at 1px 1px, rgba(56, 225, 176, 0.06) 1px, transparent 0);
+  background-size: 22px 22px;
+}
