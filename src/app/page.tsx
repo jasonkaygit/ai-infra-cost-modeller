@@ -1035,7 +1035,7 @@ function Header() {
         <div className="flex items-center gap-3">
           <SignalMark />
           <div>
-            <div className="text-sm font-semibold tracking-tight text-ink">Voice AI Cost &amp; ROI Model</div>
+            <div className="text-sm font-semibold tracking-tight text-ink">AI &amp; Infra Cost Modeller</div>
             <div className="eyebrow">TCO · unit economics · capacity · ROI</div>
           </div>
         </div>
