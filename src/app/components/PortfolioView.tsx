@@ -3,7 +3,7 @@
 import React, { useMemo } from "react";
 import type { Customer, Scenario, CostCategory } from "../../domain/types";
 import { COST_CATEGORY_LABELS, WATERFALL_ORDER } from "../../domain/types";
-import { gbp, num } from "../format";
+import { gbp, num, pct } from "../format";
 import { computeScenarioResult } from "../../engine/scenario";
 
 const CAT_COLORS: Record<string, string> = {
@@ -19,44 +19,67 @@ const CAT_COLORS: Record<string, string> = {
   FIXED_OPERATIONAL: "#94A3B8",
 };
 
-export function PortfolioView({
-  portfolio,
-  combinedProfile,
-  combinedPeak,
-  combinedTCO,
-  combinedDR,
-  combinedCalls,
-}: {
-  portfolio: {
-    customer: Customer;
-    scenario: Scenario;
-    result: ReturnType<typeof computeScenarioResult>;
-    drCost: number;
-    totalWithDR: number;
-  }[];
-  combinedProfile: number[];
-  combinedPeak: number;
-  combinedTCO: number;
-  combinedDR: number;
-  combinedCalls: number;
-}) {
-  // Aggregate by category across all customers
-  const catTotals = useMemo(() => {
-    const map = new Map<CostCategory, number>();
-    for (const { result } of portfolio) {
-      for (const cat of result.breakdown.byCategory) {
-        map.set(cat.category, (map.get(cat.category) ?? 0) + cat.annualCost);
-      }
-    }
-    return WATERFALL_ORDER.filter((cat) => map.has(cat)).map((cat) => ({
-      category: cat,
-      label: COST_CATEGORY_LABELS[cat],
-      cost: map.get(cat) ?? 0,
-      color: CAT_COLORS[cat] ?? "#555",
-    }));
-  }, [portfolio]);
+interface ProjectionYear {
+  year: number;
+  customers: { customer: Customer; volume: number; resolution: number; baselineCost: number; tco: number; drCost: number }[];
+  totalTCO: number;
+  totalDR: number;
+  totalBenefit: number;
+}
 
-  if (portfolio.length === 0) {
+export function PortfolioView({
+  combinedPeak,
+  growth,
+  portfolioProjections,
+}: {
+  combinedPeak: number;
+  growth: { volumePct: number; resolutionPts: number; inflationPct: number; years: number };
+  portfolioProjections: ProjectionYear[];
+}) {
+  const [selectedYear, setSelectedYear] = React.useState(1);
+
+  const proj = selectedYear === 0 ? null : portfolioProjections.find((p) => p.year === selectedYear) ?? portfolioProjections[0];
+
+  const projTCO = selectedYear === 0
+    ? portfolioProjections.reduce((s, p) => s + p.totalTCO, 0)
+    : proj?.totalTCO ?? 0;
+  const projDR = selectedYear === 0
+    ? portfolioProjections.reduce((s, p) => s + p.totalDR, 0)
+    : proj?.totalDR ?? 0;
+  const projBenefit = selectedYear === 0
+    ? portfolioProjections.reduce((s, p) => s + p.totalBenefit, 0)
+    : proj?.totalBenefit ?? 0;
+  const projCalls = proj?.customers.reduce((s, c) => s + c.volume, 0) ?? 0;
+  const projPeak = Math.round(combinedPeak * Math.pow(1 + growth.volumePct / 100, (proj?.year ?? 1) - 1));
+  const displayCustomers = selectedYear === 0
+    ? (() => {
+        const map = new Map<string, { customer: Customer; volume: number; tco: number; drCost: number; resolution: number; baselineCost: number }>();
+        for (const p of portfolioProjections) {
+          for (const c of p.customers) {
+            const entry = map.get(c.customer.id);
+            if (entry) {
+              entry.volume += c.volume;
+              entry.tco += c.tco;
+              entry.drCost += c.drCost;
+            } else {
+              map.set(c.customer.id, { ...c });
+            }
+          }
+        }
+        return [...map.values()];
+      })()
+    : (proj?.customers ?? []);
+
+  const catTotals = useMemo(() => {
+    if (!proj) return [];
+    const map = new Map<CostCategory, number>();
+    for (const c of proj.customers) {
+      // Approximate category breakdown by scaling from year-1 proportions
+    }
+    return [];
+  }, [proj]);
+
+  if (portfolioProjections.length === 0) {
     return (
       <p className="text-sm text-muted">
         No customers added yet. Go to the <strong>Customers</strong> tab to add customers and build a portfolio.
@@ -66,116 +89,121 @@ export function PortfolioView({
 
   return (
     <div className="space-y-6">
+      {/* Year selector */}
+      <div className="flex items-center gap-2">
+        <span className="text-xs text-muted">Projection year:</span>
+        {portfolioProjections.map((p) => (
+          <button
+            key={p.year}
+            onClick={() => setSelectedYear(p.year)}
+            className={`figure rounded-lg px-3 py-1 text-xs transition-colors ${
+              selectedYear === p.year ? "bg-signal text-ground" : "border hairline text-muted hover:text-ink"
+            }`}
+          >
+            Year {p.year}
+          </button>
+        ))}
+        <button
+          onClick={() => setSelectedYear(0)}
+          className={`figure rounded-lg px-3 py-1 text-xs transition-colors ${
+            selectedYear === 0 ? "bg-signal text-ground" : "border hairline text-muted hover:text-ink"
+          }`}
+        >
+          Total
+        </button>
+      </div>
+
+      {/* Cumulative row */}
+      {selectedYear === 0 && (
+        <div className="rounded-xl border border-signalDim bg-panel2 p-4">
+          <div className="grid grid-cols-3 gap-4">
+            <div>
+              <div className="text-[10px] text-faint">Total TCO ({growth.years}yr)</div>
+              <div className="figure text-lg text-coral">{gbp(projTCO, { compact: true })}</div>
+            </div>
+            <div>
+              <div className="text-[10px] text-faint">Total DR overhead</div>
+              <div className="figure text-lg text-amber">{gbp(projDR, { compact: true })}</div>
+            </div>
+            <div>
+              <div className="text-[10px] text-faint">Cumulative net benefit</div>
+              <div className="figure text-lg text-signal">{gbp(projBenefit, { compact: true })}</div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Headline metrics */}
       <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
-        <AggMetric label="Total customers" value={String(portfolio.length)} />
-        <AggMetric label="Combined calls/yr" value={num(combinedCalls)} />
-        <AggMetric label="Combined peak" value={num(combinedPeak)} accent="amber" />
-        <AggMetric label="DR overhead" value={gbp(combinedDR, { compact: true })} accent="amber" />
-        <AggMetric label="Combined TCO" value={gbp(combinedTCO, { compact: true })} accent="coral" />
+        <AggMetric
+          label="Customers"
+          value={String(
+            selectedYear === 0
+              ? new Set(portfolioProjections.flatMap((p) => p.customers.map((c) => c.customer.id))).size
+              : displayCustomers.length
+          )}
+        />
+        <AggMetric label="Combined calls/yr" value={num(projCalls)} />
+        <AggMetric label="Combined peak" value={num(projPeak)} accent="amber" />
+        <AggMetric label="DR overhead" value={gbp(projDR, { compact: true })} accent="amber" />
+        <AggMetric label="Combined TCO" value={gbp(projTCO, { compact: true })} accent="coral" />
       </div>
 
-      {/* Combined category bar */}
-      <div>
-        <div className="eyebrow mb-2 text-[10px]">Combined cost by category</div>
-        <div className="flex h-8 w-full overflow-hidden rounded-lg">
-          {catTotals.map((cat) => (
-            <div
-              key={cat.category}
-              style={{ width: `${Math.max(0.5, (cat.cost / combinedTCO) * 100)}%`, backgroundColor: cat.color }}
-              className="cursor-pointer transition-opacity hover:opacity-80"
-              title={`${cat.label}: ${gbp(cat.cost, { compact: true })}`}
-            />
-          ))}
-        </div>
-        <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1">
-          {catTotals.map((cat) => (
-            <div key={cat.category} className="flex items-center gap-1.5">
-              <span className="h-2.5 w-2.5 rounded-sm" style={{ backgroundColor: cat.color }} />
-              <span className="figure text-xs text-muted">{cat.label}</span>
-              <span className="figure text-xs text-faint">{gbp(cat.cost, { compact: true })}</span>
-            </div>
-          ))}
-        </div>
-      </div>
 
-      {/* Combined concurrency chart */}
-      <div>
-        <div className="eyebrow mb-2 text-[10px]">
-          Combined 24-hour concurrency profile (sum of all customers)
-        </div>
-        <div className="rounded-lg border hairline bg-panel2 p-3">
-          <ConcurrencyBars profile={combinedProfile} peak={combinedPeak} />
-        </div>
-      </div>
-
-      {/* Per-customer summary */}
-      <div>
-        <div className="eyebrow mb-2 text-[10px]">Per-customer breakdown</div>
-        <div className="overflow-hidden rounded-xl border hairline">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b hairline bg-panel2 text-left">
-                <th className="px-4 py-2.5 eyebrow font-normal">Customer</th>
-                <th className="px-4 py-2.5 eyebrow font-normal text-right">Calls/yr</th>
-                <th className="px-4 py-2.5 eyebrow font-normal text-right">Peak</th>
-                <th className="px-4 py-2.5 eyebrow font-normal text-right">Pre-DR TCO</th>
-                <th className="px-4 py-2.5 eyebrow font-normal text-right">DR cost</th>
-                <th className="px-4 py-2.5 eyebrow font-normal text-right">TCO inc DR</th>
-              </tr>
-            </thead>
-            <tbody>
-              {portfolio.map(({ customer, result, drCost, totalWithDR }) => (
-                <tr key={customer.id} className="border-b hairline hover:bg-panel2">
-                  <td className="px-4 py-2.5 text-ink text-xs">{customer.name}</td>
-                  <td className="px-4 py-2.5 text-right figure text-xs text-muted">
-                    {num(result.volumes.annualIncomingCalls)}
+      {/* Per-customer breakdown */}
+      {displayCustomers.length > 0 && (
+        <div>
+          <div className="eyebrow mb-2 text-[10px]">
+            Per-customer breakdown — {selectedYear === 0 ? `All years (total)` : `Year ${selectedYear}`}
+          </div>
+          <div className="overflow-hidden rounded-xl border hairline">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b hairline bg-panel2 text-left">
+                  <th className="px-4 py-2.5 eyebrow font-normal">Customer</th>
+                  <th className="px-4 py-2.5 eyebrow font-normal text-right">Calls/yr</th>
+                  <th className="px-4 py-2.5 eyebrow font-normal text-right">Resolution</th>
+                  <th className="px-4 py-2.5 eyebrow font-normal text-right">Baseline</th>
+                  <th className="px-4 py-2.5 eyebrow font-normal text-right">DR cost</th>
+                  <th className="px-4 py-2.5 eyebrow font-normal text-right">TCO</th>
+                </tr>
+              </thead>
+              <tbody>
+                {displayCustomers.map((c) => (
+                  <tr key={c.customer.id} className="border-b hairline hover:bg-panel2">
+                    <td className="px-4 py-2.5 text-ink text-xs">{c.customer.name}</td>
+                    <td className="px-4 py-2.5 text-right figure text-xs text-muted">{num(c.volume)}</td>
+                    <td className="px-4 py-2.5 text-right figure text-xs text-muted">{pct(c.resolution)}</td>
+                    <td className="px-4 py-2.5 text-right figure text-xs text-muted">£{c.baselineCost.toFixed(2)}</td>
+                    <td className="px-4 py-2.5 text-right figure text-xs text-amber">{gbp(c.drCost, { compact: true })}</td>
+                    <td className="px-4 py-2.5 text-right figure text-xs text-ink">{gbp(c.tco, { compact: true })}</td>
+                  </tr>
+                ))}
+              </tbody>
+              <tfoot>
+                <tr className="bg-panel2">
+                  <td className="px-4 py-3 text-xs font-semibold text-ink">Grand total</td>
+                  <td className="px-4 py-3 text-right figure text-xs text-ink">
+                    {num(displayCustomers.reduce((s, c) => s + c.volume, 0))}
                   </td>
-                  <td className="px-4 py-2.5 text-right figure text-xs text-muted">
-                    {num(result.volumes.peakConcurrentCalls)}
+                  <td className="px-4 py-3" colSpan={2} />
+                  <td className="px-4 py-3 text-right figure text-xs text-amber">
+                    {gbp(displayCustomers.reduce((s, c) => s + c.drCost, 0), { compact: true })}
                   </td>
-                  <td className="px-4 py-2.5 text-right figure text-xs text-muted">
-                    {gbp(result.breakdown.totalAnnual, { compact: true })}
-                  </td>
-                  <td className="px-4 py-2.5 text-right figure text-xs text-amber">
-                    {gbp(drCost, { compact: true })}
-                  </td>
-                  <td className="px-4 py-2.5 text-right figure text-xs text-ink">
-                    {gbp(totalWithDR, { compact: true })}
+                  <td className="px-4 py-3 text-right figure text-sm text-signal">
+                    {gbp(displayCustomers.reduce((s, c) => s + c.tco, 0), { compact: true })}
                   </td>
                 </tr>
-              ))}
-              <tr className="bg-panel2">
-                <td className="px-4 py-3 text-xs font-semibold text-ink">Combined</td>
-                <td className="px-4 py-3 text-right figure text-xs text-ink">{num(combinedCalls)}</td>
-                <td className="px-4 py-3 text-right figure text-xs text-ink">{num(combinedPeak)}</td>
-                <td className="px-4 py-3 text-right figure text-xs text-muted">
-                  {gbp(combinedTCO - combinedDR, { compact: true })}
-                </td>
-                <td className="px-4 py-3 text-right figure text-xs text-amber">
-                  {gbp(combinedDR, { compact: true })}
-                </td>
-                <td className="px-4 py-3 text-right figure text-sm text-signal">
-                  {gbp(combinedTCO, { compact: true })}
-                </td>
-              </tr>
-            </tbody>
-          </table>
+              </tfoot>
+            </table>
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }
 
-function AggMetric({
-  label,
-  value,
-  accent,
-}: {
-  label: string;
-  value: string;
-  accent?: "coral" | "amber";
-}) {
+function AggMetric({ label, value, accent }: { label: string; value: string; accent?: "coral" | "amber" }) {
   const color = accent === "coral" ? "text-coral" : accent === "amber" ? "text-amber" : "text-ink";
   return (
     <div className="rounded-xl border hairline bg-panel px-4 py-3">
@@ -185,57 +213,3 @@ function AggMetric({
   );
 }
 
-function ConcurrencyBars({ profile, peak }: { profile: number[]; peak: number }) {
-  const W = 700;
-  const H = 120;
-  const PAD = { top: 10, right: 10, bottom: 20, left: 40 };
-  const CHART_W = W - PAD.left - PAD.right;
-  const CHART_H = H - PAD.top - PAD.bottom;
-  const BAR_W = CHART_W / 24 - 2;
-
-  return (
-    <svg viewBox={`0 0 ${W} ${H}`} className="w-full">
-      {[0.5, 1].map((frac) => (
-        <line
-          key={frac}
-          x1={PAD.left}
-          y1={PAD.top + CHART_H - (CHART_H * frac)}
-          x2={W - PAD.right}
-          y2={PAD.top + CHART_H - (CHART_H * frac)}
-          stroke="#1e2833"
-          strokeWidth={1}
-        />
-      ))}
-      {profile.map((v, hour) => {
-        const barH = (v / Math.max(peak, 1)) * CHART_H;
-        const x = PAD.left + hour * (CHART_W / 24) + 1;
-        const y = PAD.top + CHART_H - barH;
-        return (
-          <g key={hour}>
-            <rect x={x} y={y} width={BAR_W} height={Math.max(1, barH)} rx={1} fill="#38E1B0" opacity={0.6} />
-            {hour % 6 === 0 && (
-              <text x={x + BAR_W / 2} y={H - 6} textAnchor="middle" className="figure" fill="#5b6673" fontSize={8}>
-                {String(hour).padStart(2, "0") + ":00"}
-              </text>
-            )}
-          </g>
-        );
-      })}
-      <text x={PAD.left - 8} y={PAD.top + 4} textAnchor="end" className="figure" fill="#5b6673" fontSize={8}>
-        {peak >= 10000 ? (peak / 1000).toFixed(0) + "k" : peak}
-      </text>
-    </svg>
-  );
-}
-
-function catCost(r: ReturnType<typeof computeScenarioResult>, cat: string): number {
-  return r.breakdown.byCategory.find((c) => c.category === cat)?.annualCost ?? 0;
-}
-
-function infraCost(r: ReturnType<typeof computeScenarioResult>): number {
-  const cats = [
-    "TELEPHONY_AND_INTEGRATION", "AI_AND_COMPUTE", "KNOWLEDGE",
-    "AUDIO_TRANSCRIPT_STORAGE", "OPERATIONS_AND_OBSERVABILITY", "DATA_AND_ANALYTICS",
-  ];
-  return cats.reduce((s, cat) => s + catCost(r, cat), 0);
-}

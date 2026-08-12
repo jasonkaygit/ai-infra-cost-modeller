@@ -50,26 +50,59 @@ export default function Page() {
   const [showAddForm, setShowAddForm] = useState(false);
   const [activeTab, setActiveTab] = useState<"overview" | "customers" | "portfolio">("overview");
 
+  // Growth rates for multi-year projection
+  const [growth, setGrowth] = useState(() =>
+    loadJSON("voice-ai:growth", { volumePct: 15, resolutionPts: 3, inflationPct: 3, years: 3 })
+  );
+  useEffect(() => { saveJSON("voice-ai:growth", growth); }, [growth]);
+
+  // Auto-set default concurrency profile if none is set on the active scenario
+  useEffect(() => {
+    if (!scenario.callProfile.concurrencyProfile) {
+      setCall({ concurrencyProfile: DEFAULT_CONCURRENCY });
+    }
+  }, []); // run once on mount
+
   // Persist active scenario + counter
   useEffect(() => { saveJSON(LS_KEYS.activeScenarioId, scenario); }, [scenario]);
 
-  // Scenarios
+  // Scenarios — ensure all have a concurrency profile
+  const DEFAULT_CONCURRENCY = [500, 300, 200, 150, 150, 200, 500, 1000, 4000, 8000, 10000, 12000, 12000, 11000, 10000, 9000, 8000, 6000, 4000, 2000, 1500, 1200, 1000, 800];
+  const ensureProfile = (s: Scenario): Scenario => ({
+    ...s,
+    callProfile: {
+      ...s.callProfile,
+      concurrencyProfile: s.callProfile.concurrencyProfile ?? DEFAULT_CONCURRENCY,
+    },
+  });
   const [scenarios, setScenarios] = useState<Scenario[]>(() =>
-    loadJSON(LS_KEYS.scenarios, SEED_SCENARIOS.map((s) => ({ ...s })))
+    loadJSON(LS_KEYS.scenarios, SEED_SCENARIOS.map((s) => ensureProfile({ ...s }))).map(ensureProfile)
   );
   const counterData = loadJSON<{ scenario: number; customer: number }>(LS_KEYS.counter, { scenario: SEED_SCENARIOS.length, customer: 0 });
   const scenarioIdCounter = useRef(Math.max(SEED_SCENARIOS.length, counterData.scenario));
 
   useEffect(() => { saveJSON(LS_KEYS.scenarios, scenarios); }, [scenarios]);
-  useEffect(() => { saveJSON(LS_KEYS.counter, { scenario: scenarioIdCounter.current, customer: customerIdCounter.current }); }, [scenarios]);
 
-  // Customers
-  const [customers, setCustomers] = useState<Customer[]>(() =>
-    loadJSON(LS_KEYS.customers, [])
-  );
-  const customerIdCounter = useRef(counterData.customer);
+  // Customers — recover counter from existing data to avoid ID collisions
+  const savedCustomers = loadJSON<Customer[]>(LS_KEYS.customers, []);
+  const maxCustomerId = savedCustomers.reduce((max, c) => {
+    const n = parseInt(c.id.replace("customer-", ""), 10);
+    return isNaN(n) ? max : Math.max(max, n);
+  }, 0);
+  // Rebuild with guaranteed unique IDs if duplicates exist
+  let nextId = Math.max(maxCustomerId, counterData.customer);
+  const fixedCustomers = savedCustomers.map((c, i) => {
+    if (savedCustomers.findIndex((x) => x.id === c.id) !== i) {
+      return { ...c, id: `customer-${++nextId}` };
+    }
+    return c;
+  });
+
+  const [customers, setCustomers] = useState<Customer[]>(fixedCustomers);
+  const customerIdCounter = useRef(nextId);
 
   useEffect(() => { saveJSON(LS_KEYS.customers, customers); }, [customers]);
+  useEffect(() => { saveJSON(LS_KEYS.counter, { scenario: scenarioIdCounter.current, customer: customerIdCounter.current }); }, [scenarios, customers]);
 
   const addCustomer = useCallback(() => {
     const n = ++customerIdCounter.current;
@@ -198,22 +231,78 @@ export default function Page() {
     }[];
   }, [customers, scenarios, supplier, componentsWithoutDR, driverOverrides]);
 
-  // Combined concurrency profile: sum all customers' profiles hour-by-hour
-  const combinedProfile = useMemo(() => {
-    const profile = Array(24).fill(0);
-    for (const { customer, scenario: scen } of portfolio) {
-      const cp = customer.concurrencyProfile ?? scen.callProfile.concurrencyProfile;
-      if (cp && cp.length === 24) {
-        for (let h = 0; h < 24; h++) profile[h] += cp[h];
-      }
-    }
-    return profile;
-  }, [portfolio]);
-
-  const combinedPeak = Math.max(...combinedProfile, 1);
+  const combinedPeak = Math.max(
+    ...(scenario.callProfile.concurrencyProfile ?? DEFAULT_CONCURRENCY),
+    1
+  );
   const combinedTCO = portfolio.reduce((s, p) => s + p.totalWithDR, 0);
   const combinedDR = portfolio.reduce((s, p) => s + p.drCost, 0);
   const combinedCalls = portfolio.reduce((s, p) => s + p.result.volumes.annualIncomingCalls, 0);
+
+  // Multi-year portfolio projections: compute full engine run per customer per year
+  const portfolioProjections = useMemo(() => {
+    const years = growth.years;
+    const result: { year: number; customers: { customer: Customer; volume: number; resolution: number; baselineCost: number; tco: number; drCost: number; }[]; totalTCO: number; totalDR: number; totalBenefit: number; }[] = [];
+    for (let y = 1; y <= years; y++) {
+      let factor = 1; let resPts = 0;
+      for (let yy = 2; yy <= y; yy++) { factor *= 1 + growth.volumePct / 100; resPts += growth.resolutionPts / 100; }
+      const inflation = Math.pow(1 + growth.inflationPct / 100, y - 1);
+      const activeDrPct = scenario.drOverheadPct ?? 0;
+      const activeProf = scenario.callProfile.concurrencyProfile;
+      const customers = portfolio.map(({ customer, scenario: custScenario }) => {
+        const vol = Math.round(custScenario.callProfile.annualIncomingCalls * factor);
+        const res = Math.min(0.95, custScenario.outcome.resolutionRate + resPts);
+        const bl = custScenario.baseline.simpleCurrentCostPerContact * inflation;
+        const cp = customer.concurrencyProfile ?? custScenario.callProfile.concurrencyProfile ?? activeProf;
+        const scen: Scenario = {
+          ...custScenario,
+          callProfile: { ...custScenario.callProfile, annualIncomingCalls: vol, concurrencyProfile: cp },
+          outcome: { ...custScenario.outcome, resolutionRate: res },
+          baseline: { ...custScenario.baseline, simpleCurrentCostPerContact: bl, currentAnnualCallVolume: vol },
+        };
+        const r = computeScenarioResult(scen, supplier, componentsWithoutDR, driverOverrides);
+        const preDR = r.breakdown.totalAnnual;
+        const dr = (activeDrPct / 100) * preDR;
+        return { customer, volume: vol, resolution: res, baselineCost: bl, tco: preDR + dr, drCost: dr };
+      });
+      result.push({
+        year: y,
+        customers,
+        totalTCO: customers.reduce((s, c) => s + c.tco, 0),
+        totalDR: customers.reduce((s, c) => s + c.drCost, 0),
+        totalBenefit: customers.reduce((s, c) => s + c.baselineCost * c.volume - c.tco, 0),
+      });
+    }
+    return result;
+  }, [portfolio, growth, supplier, componentsWithoutDR, driverOverrides]);
+
+  // Multi-year projection
+  const projection = useMemo(() => {
+    const rows = [];
+    let vol = scenario.callProfile.annualIncomingCalls;
+    let res = scenario.outcome.resolutionRate;
+    let bl = scenario.baseline.simpleCurrentCostPerContact;
+    let cumNet = 0;
+    for (let y = 1; y <= growth.years; y++) {
+      const scen: Scenario = {
+        ...scenario,
+        callProfile: { ...scenario.callProfile, annualIncomingCalls: Math.round(vol) },
+        outcome: { ...scenario.outcome, resolutionRate: Math.min(0.95, res) },
+        baseline: { ...scenario.baseline, simpleCurrentCostPerContact: bl, currentAnnualCallVolume: Math.round(vol) },
+      };
+      const r = computeScenarioResult(scen, supplier, componentsWithoutDR, driverOverrides);
+      const preDR = r.breakdown.totalAnnual;
+      const drCost = ((scen.drOverheadPct ?? 0) / 100) * preDR;
+      const tco = preDR + drCost;
+      const benefit = r.roi.baselineAnnualCost - tco;
+      cumNet += benefit;
+      rows.push({ year: y, volume: Math.round(vol), resolution: res, baselineCost: bl, tco, drCost, netBenefit: benefit, cumulativeNetBenefit: cumNet });
+      vol *= 1 + growth.volumePct / 100;
+      res = Math.min(0.95, res + growth.resolutionPts / 100);
+      bl *= 1 + growth.inflationPct / 100;
+    }
+    return rows;
+  }, [scenario, supplier, componentsWithoutDR, driverOverrides, growth]);
 
   const handleLoadScenario = useCallback((id: string) => {
     const target = scenarios.find((s) => s.id === id);
@@ -223,13 +312,13 @@ export default function Page() {
   const handleNewScenario = useCallback(() => {
     const n = ++scenarioIdCounter.current;
     const id = `custom-scenario-${n}`;
-    const fresh: Scenario = {
+    const fresh: Scenario = ensureProfile({
       ...SEED_SCENARIOS[0],
       id,
       name: `Scenario ${n}`,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-    };
+    });
     setScenarios((prev) => [...prev, fresh]);
     // Snapshot current components for the new scenario
     setComponentSnapshots((prev) => ({
@@ -590,6 +679,81 @@ export default function Page() {
           </div>
         </section>
 
+        {/* Growth curves */}
+        <section className="mt-8">
+          <div className="rounded-2xl border hairline bg-panel p-5">
+            <SectionLabel n="GR" title="Multi-year projection" />
+            <p className="mb-3 text-xs text-muted">
+              Compound annual growth applied to year-1 baseline. Projects TCO, net benefit, and cumulative
+              savings over multiple years.
+            </p>
+            <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_1fr]">
+              <div className="space-y-4">
+                <Slider
+                  label="Volume growth"
+                  description={`${growth.volumePct}% more calls each year`}
+                  min={0} max={50} step={1}
+                  value={growth.volumePct}
+                  onChange={(v) => setGrowth((g) => ({ ...g, volumePct: v }))}
+                  format={(v) => `${v}%`}
+                />
+                <Slider
+                  label="Resolution improvement"
+                  description={`+${growth.resolutionPts} percentage points per year`}
+                  min={0} max={10} step={0.5}
+                  value={growth.resolutionPts}
+                  onChange={(v) => setGrowth((g) => ({ ...g, resolutionPts: v }))}
+                  format={(v) => `+${v}pp`}
+                />
+                <Slider
+                  label="Baseline cost inflation"
+                  description={`Human cost per contact inflates ${growth.inflationPct}% per year`}
+                  min={0} max={10} step={0.5}
+                  value={growth.inflationPct}
+                  onChange={(v) => setGrowth((g) => ({ ...g, inflationPct: v }))}
+                  format={(v) => `${v}%`}
+                />
+                <Slider
+                  label="Projection years"
+                  description={`Show ${growth.years} years of projections`}
+                  min={1} max={5} step={1}
+                  value={growth.years}
+                  onChange={(v) => setGrowth((g) => ({ ...g, years: v }))}
+                  format={(v) => `${v}yr`}
+                />
+              </div>
+              <div className="overflow-hidden rounded-xl border hairline">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b hairline bg-panel2 text-left">
+                      <th className="px-3 py-2 eyebrow font-normal">Year</th>
+                      <th className="px-3 py-2 eyebrow font-normal text-right">Volume</th>
+                      <th className="px-3 py-2 eyebrow font-normal text-right">Resolution</th>
+                      <th className="px-3 py-2 eyebrow font-normal text-right">Baseline</th>
+                      <th className="px-3 py-2 eyebrow font-normal text-right">TCO</th>
+                      <th className="px-3 py-2 eyebrow font-normal text-right">Net benefit</th>
+                      <th className="px-3 py-2 eyebrow font-normal text-right">Cumulative</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {projection.map((row, i) => (
+                      <tr key={row.year} className={`border-b hairline ${i === 0 ? "bg-signal/5" : ""}`}>
+                        <td className="px-3 py-2 figure text-xs text-ink">Year {row.year}</td>
+                        <td className="px-3 py-2 text-right figure text-xs text-muted">{num(row.volume)}</td>
+                        <td className="px-3 py-2 text-right figure text-xs text-muted">{pct(row.resolution)}</td>
+                        <td className="px-3 py-2 text-right figure text-xs text-muted">£{row.baselineCost.toFixed(2)}</td>
+                        <td className="px-3 py-2 text-right figure text-xs text-ink">{gbp(row.tco, { compact: true })}</td>
+                        <td className="px-3 py-2 text-right figure text-xs text-signal">{gbp(row.netBenefit, { compact: true })}</td>
+                        <td className="px-3 py-2 text-right figure text-xs text-signal">{gbp(row.cumulativeNetBenefit, { compact: true })}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </section>
+
         {/* Cost waterfall */}
         <section className="mt-6">
           <div className="rounded-2xl border hairline bg-panel p-5">
@@ -792,10 +956,10 @@ export default function Page() {
               <CustomerManager
                 customers={customers}
                 scenarios={scenarios}
-                portfolio={portfolio}
                 onAdd={addCustomer}
                 onUpdate={updateCustomer}
                 onRemove={removeCustomer}
+                portfolioProjections={portfolioProjections}
               />
             </div>
           </section>
@@ -806,12 +970,9 @@ export default function Page() {
             <div className="rounded-2xl border hairline bg-panel p-5">
               <SectionLabel n="PF" title="Portfolio" />
               <PortfolioView
-                portfolio={portfolio}
-                combinedProfile={combinedProfile}
                 combinedPeak={combinedPeak}
-                combinedTCO={combinedTCO}
-                combinedDR={combinedDR}
-                combinedCalls={combinedCalls}
+                growth={growth}
+                portfolioProjections={portfolioProjections}
               />
             </div>
           </section>
