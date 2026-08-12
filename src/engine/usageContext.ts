@@ -106,9 +106,9 @@ export function buildUsageContext(
   // AI minutes: contained calls spend containment duration; escalated calls
   // spend the pre-escalation duration. Both incur AI cost.
   const aiMinutes =
-    v.resolvedCalls * cp.aiDurationBeforeContainmentMin +
-    v.escalatedCalls * cp.aiDurationBeforeEscalationMin +
-    (v.abandonedCalls + v.failedCalls) * cp.aiDurationBeforeEscalationMin;
+    v.resolvedCalls * cp.aiDurationForResolvedCallMin +
+    v.escalatedCalls * cp.aiDurationBeforeHandoffMin +
+    (v.abandonedCalls + v.failedCalls) * cp.aiDurationBeforeHandoffMin;
 
   // Human minutes after escalation. AHT reduction from AI pre-processing applies
   // ONLY to escalated calls (AI handed off to human). Calls never offered to AI
@@ -116,13 +116,13 @@ export function buildUsageContext(
   // residualHuman = notOffered + escalated + failed, so:
   // (residualHuman - escalated) = notOffered + failed
   const humanMinutes =
-    (v.residualHumanCalls - v.escalatedCalls) * cp.humanDurationAfterEscalationMin +
+    (v.residualHumanCalls - v.escalatedCalls) * cp.humanDurationAfterHandoffMin +
     v.escalatedCalls *
-      cp.humanDurationAfterEscalationMin *
+      cp.humanDurationAfterHandoffMin *
       (1 - clamp01(outcome.ahtReductionAfterTransfer));
 
   // Telephony minutes: AI leg + human leg for escalated calls carry telephony.
-  const telephonyMinutes = aiMinutes + v.escalatedCalls * cp.humanDurationAfterEscalationMin;
+  const telephonyMinutes = aiMinutes + v.escalatedCalls * cp.humanDurationAfterHandoffMin;
 
   // Storage GB-months (steady state): retained volume averaged over retention window.
   const audioGbPerCall = cp.averageCallDurationMin * st.audioMbPerMinute * GB_PER_MB;

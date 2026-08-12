@@ -37,7 +37,7 @@ test("INVARIANT: escalated calls still incur AI cost (AI minutes include escalat
   const ctx = buildUsageContext(scenario);
   const v = ctx.volumes;
   // AI minutes must exceed contained-only minutes because escalated calls add AI time.
-  const containedOnly = v.resolvedCalls * scenario.callProfile.aiDurationBeforeContainmentMin;
+  const containedOnly = v.resolvedCalls * scenario.callProfile.aiDurationForResolvedCallMin;
   assert.ok(ctx.drivers.AI_MINUTES > containedOnly);
 });
 

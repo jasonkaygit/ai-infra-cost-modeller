@@ -217,9 +217,9 @@ export interface CallProfile {
   operatingDaysPerYear: number;
   operatingHoursPerDay: number;
   averageCallDurationMin: number;
-  aiDurationBeforeContainmentMin: number;
-  aiDurationBeforeEscalationMin: number;
-  humanDurationAfterEscalationMin: number;
+  aiDurationForResolvedCallMin: number;
+  aiDurationBeforeHandoffMin: number;
+  humanDurationAfterHandoffMin: number;
   peakHourCallPercentage: number; // fraction of daily calls in peak hour, 0..1
   peakToAverageMultiplier: number;
   /** Months to ramp from 0→100% of steady-state volume. 0 = instant.  */

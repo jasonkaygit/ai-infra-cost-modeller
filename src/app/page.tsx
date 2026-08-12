@@ -568,9 +568,9 @@ export default function Page() {
                   const ratio = v / scenario.callProfile.averageCallDurationMin;
                   setCall({
                     averageCallDurationMin: v,
-                    aiDurationBeforeContainmentMin: scenario.callProfile.aiDurationBeforeContainmentMin * ratio,
-                    aiDurationBeforeEscalationMin: scenario.callProfile.aiDurationBeforeEscalationMin * ratio,
-                    humanDurationAfterEscalationMin: scenario.callProfile.humanDurationAfterEscalationMin * ratio,
+                    aiDurationForResolvedCallMin: scenario.callProfile.aiDurationForResolvedCallMin * ratio,
+                    aiDurationBeforeHandoffMin: scenario.callProfile.aiDurationBeforeHandoffMin * ratio,
+                    humanDurationAfterHandoffMin: scenario.callProfile.humanDurationAfterHandoffMin * ratio,
                   });
                 }}
                 format={(v) => `${v} min`}
