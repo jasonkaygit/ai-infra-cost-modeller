@@ -28,6 +28,7 @@ const LS_KEYS = {
   counter: "voice-ai:counter",
 };
 
+// Dual-write: localStorage (sync, fast) + IndexedDB (async, durable)
 function loadJSON<T>(key: string, fallback: T): T {
   try {
     const raw = localStorage.getItem(key);
@@ -36,7 +37,17 @@ function loadJSON<T>(key: string, fallback: T): T {
 }
 
 function saveJSON(key: string, value: unknown) {
-  try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* quota exceeded */ }
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* quota */ }
+  try {
+    // Background sync to IndexedDB for durability
+    const req = indexedDB.open("ai-cost-modeller", 1);
+    req.onupgradeneeded = () => { req.result.createObjectStore("kv"); };
+    req.onsuccess = () => {
+      const tx = req.result.transaction("kv", "readwrite");
+      tx.objectStore("kv").put(value, key);
+      tx.oncomplete = () => req.result.close();
+    };
+  } catch { /* IndexedDB unavailable */ }
 }
 
 export default function Page() {
@@ -49,6 +60,27 @@ export default function Page() {
   const [showBreakdown, setShowBreakdown] = useState(true);
   const [showAddForm, setShowAddForm] = useState(false);
   const [activeTab, setActiveTab] = useState<"overview" | "customers" | "portfolio">("overview");
+
+  // One-time: restore from IndexedDB if localStorage was cleared
+  useEffect(() => {
+    const keys = [
+      "voice-ai:scenarios", "voice-ai:components", "voice-ai:customers",
+      "voice-ai:overrides", "voice-ai:activeScenarioId", "voice-ai:counter", "voice-ai:growth",
+    ];
+    const allEmpty = keys.every((k) => !localStorage.getItem(k));
+    if (!allEmpty) return;
+    const req = indexedDB.open("ai-cost-modeller", 1);
+    req.onupgradeneeded = () => { req.result.createObjectStore("kv"); };
+    req.onsuccess = () => {
+      const db = req.result;
+      const tx = db.transaction("kv", "readonly");
+      keys.forEach((k) => {
+        const r = tx.objectStore("kv").get(k);
+        r.onsuccess = () => { if (r.result != null) localStorage.setItem(k, JSON.stringify(r.result)); };
+      });
+      tx.oncomplete = () => { db.close(); window.location.reload(); };
+    };
+  }, []);
 
   // Growth rates for multi-year projection
   const [growth, setGrowth] = useState(() =>
@@ -455,7 +487,15 @@ export default function Page() {
           <HeroThesis result={result} scenario={scenario} />
           <div className="space-y-4">
             <div className="rounded-2xl border hairline bg-panel p-5">
-              <SectionLabel n="00" title="Scenarios" />
+              <div className="mb-3 flex items-center justify-between">
+                <SectionLabel n="00" title="Scenarios" inline />
+                <button
+                  onClick={() => exportCSV(scenario, result, projection, portfolio, portfolioProjections)}
+                  className="figure rounded border border-signalDim px-2 py-1 text-[10px] text-signal hover:bg-panel2"
+                >
+                  export csv
+                </button>
+              </div>
               <ScenarioManager
                 scenarios={scenarios}
                 activeId={scenario.id}
@@ -1163,6 +1203,63 @@ function SectionLabel({ n, title, inline }: { n: string; title: string; inline?:
       <h2 className="text-sm font-semibold tracking-tight text-ink">{title}</h2>
     </div>
   );
+}
+
+function toCsv(headers: string[], rows: string[][]): string {
+  const escape = (v: string) => v.includes(",") || v.includes('"') ? `"${v.replace(/"/g, '""')}"` : v;
+  return [headers.join(","), ...rows.map((r) => r.map(escape).join(","))].join("\n");
+}
+
+function downloadCSV(filename: string, csv: string) {
+  const blob = new Blob([csv], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
+function exportCSV(scenario: any, result: any, projection: any[], portfolio: any[], portfolioProjections: any[]) {
+  const parts: string[] = [];
+  // Scenario parameters
+  parts.push(toCsv(["Parameter", "Value"], [
+    ["Scenario", scenario.name],
+    ["Annual calls", String(scenario.callProfile.annualIncomingCalls)],
+    ["Avg call duration", `${scenario.callProfile.averageCallDurationMin} min`],
+    ["AI resolution", `${(scenario.outcome.resolutionRate * 100).toFixed(0)}%`],
+    ["Baseline cost/call", `£${scenario.baseline.simpleCurrentCostPerContact.toFixed(2)}`],
+    ["DR overhead", `${scenario.drOverheadPct ?? 0}%`],
+    ["Year 1 ramp", `${scenario.callProfile.yearOneRampMonths ?? 0} months`],
+    ["Investment", `£${scenario.investment.toLocaleString()}`],
+    ["", ""],
+  ]));
+  // Executive metrics
+  parts.push(toCsv(["Metric", "Value"], [
+    ["Annual TCO", `£${result.breakdown.totalAnnual.toLocaleString()}`],
+    ["Baseline cost", `£${result.roi.baselineAnnualCost.toLocaleString()}`],
+    ["Net benefit", `£${result.roi.netBenefit.toLocaleString()}`],
+    ["ROI", `${result.roi.roiPercentage.toFixed(1)}%`],
+    ["Payback", `${result.roi.paybackPeriodYears.toFixed(2)} years`],
+    ["Cost/incoming call", `£${result.costPerIncomingCall.toFixed(4)}`],
+    ["Cost/AI minute", `£${result.costPerAiMinute.toFixed(4)}`],
+    ["Cost/resolved call", `£${result.costPerResolvedCall.toFixed(4)}`],
+    ["Peak concurrency", String(result.volumes.peakConcurrentCalls)],
+    ["", ""],
+  ]));
+  // Cost breakdown
+  parts.push(toCsv(["Category", "Annual Cost", "Per Call"], result.breakdown.byCategory.map((c: any) => [c.category, `£${c.annualCost.toFixed(2)}`, `£${c.perCall.toFixed(4)}`])));
+  // Multi-year projection
+  if (projection.length > 0) {
+    parts.push(toCsv(["Year", "Volume", "Resolution", "Baseline", "TCO", "Net Benefit", "Cumulative"],
+      projection.map((r: any) => [String(r.year), String(r.volume), `${(r.resolution*100).toFixed(0)}%`, `£${r.baselineCost.toFixed(2)}`, `£${r.tco.toFixed(2)}`, `£${r.netBenefit.toFixed(2)}`, `£${r.cumulativeNetBenefit.toFixed(2)}`])
+    ));
+  }
+  // Portfolio
+  if (portfolio.length > 0 && portfolioProjections.length > 0) {
+    parts.push(toCsv(["Customer", "Year", "Volume", "TCO"],
+      portfolioProjections.flatMap((p: any) => p.customers.map((c: any) => [c.customer.name, String(p.year), String(c.volume), `£${c.tco.toFixed(2)}`]))
+    ));
+  }
+  downloadCSV(`ai-cost-model-${new Date().toISOString().slice(0,10)}.csv`, parts.join("\n\n"));
 }
 
 function SampleDataNotice() {

@@ -135,11 +135,22 @@ seed scenarios · scenario configuration UI · executive dashboard · cost water
 fixed/variable split · component breakdown with calculation traces · supplier comparison ·
 sensitivity sliders · **37 passing unit tests**.
 
-## Roadmap (later phases)
+## Phase 2 scope (delivered)
 
-- SQLite/Postgres repository implementation behind the existing `Repository` interface
-- Saved scenario persistence + side-by-side A/B/C comparison view
+- SQLite repository via sql.js — database persisted to IndexedDB
+- Multi-scenario save/load/delete with localStorage + IndexedDB dual-write
+- Multi-customer portfolio with scenario assignment and per-customer concurrency profiles
+- 24-hour concurrency profile editor with presets and drag-to-adjust bars
+- Multi-year growth projections (volume, resolution, inflation) with engine-computed TCO
+- CSV export of the executive pack
+- Cost breakdown drag-and-drop category grouping
+- Cost flow diagram and network architecture diagram
+- DR overhead slider
+- Per-minute cost metrics
+
+## Roadmap (future)
+
 - Full assumptions drawer with source / confirmed-vs-estimated / date-updated per input
 - Budget-led and target-savings solver UIs (engine already computes them)
-- Multi-currency FX
-- CSV/PDF export of the executive pack
+- Multi-currency FX with live rates
+- PDF export

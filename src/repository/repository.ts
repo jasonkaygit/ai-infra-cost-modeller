@@ -1,12 +1,7 @@
 import type { CostComponent, Supplier, Scenario } from "../domain/types";
 import { SEED_COMPONENTS, SEED_SUPPLIERS, SEED_SCENARIOS } from "../data/seed";
+import { SQLiteRepository } from "./sqliteRepository";
 
-/**
- * Repository abstraction. Phase 1 ships an in-memory implementation seeded from
- * JSON-shaped data. Because every consumer depends on this interface rather than
- * a concrete store, a SQLite or Postgres implementation can be dropped in later
- * without touching the engine or UI.
- */
 export interface Repository {
   listComponents(): Promise<CostComponent[]>;
   getComponent(id: string): Promise<CostComponent | undefined>;
@@ -21,7 +16,7 @@ export interface Repository {
   deleteScenario(id: string): Promise<void>;
 }
 
-export class InMemoryRepository implements Repository {
+class InMemoryRepository implements Repository {
   private components = new Map<string, CostComponent>();
   private suppliers = new Map<string, Supplier>();
   private scenarios = new Map<string, Scenario>();
@@ -32,39 +27,19 @@ export class InMemoryRepository implements Repository {
     SEED_SCENARIOS.forEach((s) => this.scenarios.set(s.id, s));
   }
 
-  async listComponents() {
-    return [...this.components.values()];
-  }
-  async getComponent(id: string) {
-    return this.components.get(id);
-  }
-  async upsertComponent(component: CostComponent) {
-    this.components.set(component.id, component);
-  }
-
-  async listSuppliers() {
-    return [...this.suppliers.values()];
-  }
-  async getSupplier(id: string) {
-    return this.suppliers.get(id);
-  }
-
-  async listScenarios() {
-    return [...this.scenarios.values()];
-  }
-  async getScenario(id: string) {
-    return this.scenarios.get(id);
-  }
-  async saveScenario(scenario: Scenario) {
-    this.scenarios.set(scenario.id, { ...scenario, updatedAt: new Date().toISOString() });
-  }
-  async deleteScenario(id: string) {
-    this.scenarios.delete(id);
-  }
+  async listComponents() { return [...this.components.values()]; }
+  async getComponent(id: string) { return this.components.get(id); }
+  async upsertComponent(c: CostComponent) { this.components.set(c.id, c); }
+  async listSuppliers() { return [...this.suppliers.values()]; }
+  async getSupplier(id: string) { return this.suppliers.get(id); }
+  async listScenarios() { return [...this.scenarios.values()]; }
+  async getScenario(id: string) { return this.scenarios.get(id); }
+  async saveScenario(s: Scenario) { this.scenarios.set(s.id, { ...s, updatedAt: new Date().toISOString() }); }
+  async deleteScenario(id: string) { this.scenarios.delete(id); }
 }
 
 let singleton: Repository | null = null;
 export function getRepository(): Repository {
-  if (!singleton) singleton = new InMemoryRepository();
+  if (!singleton) singleton = new SQLiteRepository();
   return singleton;
 }
