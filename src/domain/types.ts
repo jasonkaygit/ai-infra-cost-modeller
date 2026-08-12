@@ -216,10 +216,10 @@ export interface CallProfile {
   annualIncomingCalls: number;
   operatingDaysPerYear: number;
   operatingHoursPerDay: number;
+  /** Hours per day the human contact centre is staffed (0–24). Calls outside these
+   * hours are forced to AI. Default matches operatingHoursPerDay. */
+  humanOperatingHoursPerDay: number;
   averageCallDurationMin: number;
-  aiDurationForResolvedCallMin: number;
-  aiDurationBeforeHandoffMin: number;
-  humanDurationAfterHandoffMin: number;
   peakHourCallPercentage: number; // fraction of daily calls in peak hour, 0..1
   peakToAverageMultiplier: number;
   /** Months to ramp from 0→100% of steady-state volume. 0 = instant.  */
@@ -248,6 +248,7 @@ export interface HumanContactCentreBaseline {
   occupancy: number; // 0..1
   // simple mode
   simpleCurrentCostPerContact: number;
+  baselineCostPerMinute: number;
   currentAnnualCallVolume: number;
 }
 

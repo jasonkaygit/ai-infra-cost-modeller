@@ -14,6 +14,10 @@ import { buildUsageContext } from "./usageContext";
 /** Baseline (pre-AI) annual cost of the contact centre. */
 export function computeBaselineCost(baseline: HumanContactCentreBaseline): number {
   if (baseline.mode === "SIMPLE_COST_PER_CONTACT") {
+    // If per-minute cost is set, derive per-contact from it
+    if (baseline.baselineCostPerMinute > 0) {
+      return baseline.baselineCostPerMinute * baseline.currentAverageHandleTimeMin * baseline.currentAnnualCallVolume;
+    }
     return baseline.simpleCurrentCostPerContact * baseline.currentAnnualCallVolume;
   }
   // Workforce model: fully loaded agent cost × number of agents.

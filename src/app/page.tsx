@@ -52,11 +52,26 @@ function saveJSON(key: string, value: unknown) {
   }).catch(() => {});
 }
 
+  // Patch old scenarios missing newer fields
+  const DEFAULT_CONCURRENCY = [500, 300, 200, 150, 150, 200, 500, 1000, 4000, 8000, 10000, 12000, 12000, 11000, 10000, 9000, 8000, 6000, 4000, 2000, 1500, 1200, 1000, 800];
+  const ensureProfile = (s: Scenario): Scenario => ({
+    ...s,
+    callProfile: {
+      ...s.callProfile,
+      concurrencyProfile: s.callProfile.concurrencyProfile ?? DEFAULT_CONCURRENCY,
+      humanOperatingHoursPerDay: s.callProfile.humanOperatingHoursPerDay ?? 14,
+    },
+    baseline: {
+      ...s.baseline,
+      baselineCostPerMinute: s.baseline.baselineCostPerMinute ?? 0.70,
+    },
+  });
+
 export default function Page() {
   const [scenario, setScenario] = useState<Scenario>(() => {
     const saved = loadJSON<Scenario | null>(LS_KEYS.activeScenarioId, null);
-    if (saved) return saved;
-    return { ...SEED_SCENARIOS[0] };
+    if (saved) return ensureProfile(saved);
+    return ensureProfile({ ...SEED_SCENARIOS[0] });
   });
   const [waterfallMode, setWaterfallMode] = useState<"total" | "perCall">("total");
   const [showBreakdown, setShowBreakdown] = useState(true);
@@ -93,15 +108,7 @@ export default function Page() {
   // Persist active scenario + counter
   useEffect(() => { saveJSON(LS_KEYS.activeScenarioId, scenario); }, [scenario]);
 
-  // Scenarios — ensure all have a concurrency profile
-  const DEFAULT_CONCURRENCY = [500, 300, 200, 150, 150, 200, 500, 1000, 4000, 8000, 10000, 12000, 12000, 11000, 10000, 9000, 8000, 6000, 4000, 2000, 1500, 1200, 1000, 800];
-  const ensureProfile = (s: Scenario): Scenario => ({
-    ...s,
-    callProfile: {
-      ...s.callProfile,
-      concurrencyProfile: s.callProfile.concurrencyProfile ?? DEFAULT_CONCURRENCY,
-    },
-  });
+  // Scenarios — apply patches for fields added after initial save
   const [scenarios, setScenarios] = useState<Scenario[]>(() =>
     loadJSON(LS_KEYS.scenarios, SEED_SCENARIOS.map((s) => ensureProfile({ ...s }))).map(ensureProfile)
   );
@@ -258,10 +265,18 @@ export default function Page() {
     }[];
   }, [customers, scenarios, supplier, componentsWithoutDR, driverOverrides]);
 
-  const combinedPeak = Math.max(
-    ...(scenario.callProfile.concurrencyProfile ?? DEFAULT_CONCURRENCY),
-    1
-  );
+  // Off-hours percentage: fraction of concurrency outside human operating hours
+  // Assumes human shift starts at hour 8 (8am). Hours outside [8, 8+humanHours) are off-hours.
+  const profile = scenario.callProfile.concurrencyProfile ?? DEFAULT_CONCURRENCY;
+  const humanHours = scenario.callProfile.humanOperatingHoursPerDay ?? 14;
+  let offHoursSum = 0; let totalSum = 0;
+  for (let h = 0; h < 24; h++) {
+    totalSum += profile[h];
+    if (h < 8 || h >= 8 + humanHours) offHoursSum += profile[h];
+  }
+  const offHoursPct = totalSum > 0 ? Math.round((offHoursSum / totalSum) * 100) : 0;
+
+  const combinedPeak = Math.max(...profile, 1);
   const combinedTCO = portfolio.reduce((s, p) => s + p.totalWithDR, 0);
   const combinedDR = portfolio.reduce((s, p) => s + p.drCost, 0);
   const combinedCalls = portfolio.reduce((s, p) => s + p.result.volumes.annualIncomingCalls, 0);
@@ -527,19 +542,23 @@ export default function Page() {
             <SectionLabel n="01" title="Sensitivity" />
             <div className="space-y-5">
               <Slider
-                label="Baseline cost per contact"
-                description="Current fully-loaded human agent cost per call. UK onshore ~£4, offshore BPO ~£0.50, fully automated ~£0.01. The model compares AI TCO against this baseline."
+                label="Baseline cost per minute"
+                description="Current fully-loaded human agent cost per minute. UK onshore ~£0.70, offshore BPO ~£0.10. Multiplied by call duration to get per-contact baseline."
                 min={0.01}
-                max={10}
+                max={2}
                 step={0.01}
-                value={scenario.baseline.simpleCurrentCostPerContact}
+                value={scenario.baseline.baselineCostPerMinute}
                 onChange={(v) =>
                   setScenario((s) => ({
                     ...s,
-                    baseline: { ...s.baseline, simpleCurrentCostPerContact: v },
+                    baseline: {
+                      ...s.baseline,
+                      baselineCostPerMinute: v,
+                      simpleCurrentCostPerContact: v * s.callProfile.averageCallDurationMin,
+                    },
                   }))
                 }
-                format={(v) => (v < 0.1 ? `£${v.toFixed(2)}` : `£${v.toFixed(1)}`)}
+                format={(v) => `£${v.toFixed(2)}/min`}
               />
               <Slider
                 label="Annual incoming calls"
@@ -558,21 +577,38 @@ export default function Page() {
                 format={(v) => num(v)}
               />
               <Slider
+                label="Human operating hours"
+                description="Hours per day the contact centre is staffed. Calls outside these hours are forced to AI (no human agents available). 24 = round-the-clock staffing."
+                min={8}
+                max={24}
+                step={1}
+                value={scenario.callProfile.humanOperatingHoursPerDay ?? 14}
+                onChange={(v) =>
+                  setScenario((s) => ({
+                    ...s,
+                    callProfile: { ...s.callProfile, humanOperatingHoursPerDay: v },
+                  }))
+                }
+                format={(v) => `${v}h/day`}
+              />
+              <Slider
                 label="Average call duration"
                 description="How long the average call lasts, including AI and human legs. Longer calls = more telephony, AI minutes, and storage."
                 min={1}
                 max={20}
                 step={0.5}
                 value={scenario.callProfile.averageCallDurationMin}
-                onChange={(v) => {
-                  const ratio = v / scenario.callProfile.averageCallDurationMin;
-                  setCall({
-                    averageCallDurationMin: v,
-                    aiDurationForResolvedCallMin: scenario.callProfile.aiDurationForResolvedCallMin * ratio,
-                    aiDurationBeforeHandoffMin: scenario.callProfile.aiDurationBeforeHandoffMin * ratio,
-                    humanDurationAfterHandoffMin: scenario.callProfile.humanDurationAfterHandoffMin * ratio,
-                  });
-                }}
+                onChange={(v) =>
+                  setScenario((s) => ({
+                    ...s,
+                    callProfile: { ...s.callProfile, averageCallDurationMin: v },
+                    baseline: {
+                      ...s.baseline,
+                      currentAverageHandleTimeMin: v,
+                      simpleCurrentCostPerContact: s.baseline.baselineCostPerMinute * v,
+                    },
+                  }))
+                }
                 format={(v) => `${v} min`}
               />
               <Slider
@@ -659,11 +695,16 @@ export default function Page() {
               <MiniMetric label="Resolved" value={num(result.volumes.resolvedCalls)} accent="signal" />
               <MiniMetric label="Human escalations" value={num(result.volumes.escalatedCalls)} accent="violet" />
               <MiniMetric label="TCO /yr" value={gbp(result.breakdown.totalAnnual, { compact: true })} accent="coral" />
+              <MiniMetric label="Cost / AI minute" value={gbp(result.costPerAiMinute, { decimals: 3 })} accent="signal" />
+              <MiniMetric
+                label="Baseline cost/min"
+                value={`£${(scenario.baseline.baselineCostPerMinute ?? 0.70).toFixed(2)}`}
+                sub={`per-contact £${(scenario.baseline.simpleCurrentCostPerContact ?? 4.20).toFixed(2)}`}
+              />
               <MiniMetric label="Net benefit" value={gbp(result.roi.netBenefit, { compact: true })} accent={result.roi.netBenefit >= 0 ? "signal" : "coral"} />
               <MiniMetric
                 label="Baseline (pre-AI)"
                 value={gbp(result.roi.baselineAnnualCost, { compact: true })}
-                sub={`£${scenario.baseline.simpleCurrentCostPerContact.toFixed(2)}/call`}
               />
               <MiniMetric label="DR overhead" value={gbp((scenario.drOverheadPct ?? 0) > 0 ? preDRResult.breakdown.totalAnnual * drPct : 0, { compact: true })} accent="amber" />
               <MiniMetric label="ROI" value={pct(result.roi.roiPercentage / 100, 0)} accent={result.roi.roiPercentage >= 0 ? "signal" : "coral"} sub={`payback ${years(result.roi.paybackPeriodYears)}`} />
@@ -671,8 +712,8 @@ export default function Page() {
               <MiniMetric label="Infrastructure" value={gbp(infraCost(result), { compact: true })} accent="amber" />
               <MiniMetric label="Residual human" value={gbp(categoryCost(result, "HUMAN_ESCALATION"), { compact: true })} accent="violet" />
               <MiniMetric label="Voice platform" value={gbp(categoryCost(result, "VOICE_SERVICE"), { compact: true })} />
+              <MiniMetric label="Off-hours → AI" value={`${offHoursPct}%`} accent="amber" sub={`${humanHours}h human / 24h AI`} />
               <MiniMetric label="Cost / in call" value={gbp(result.costPerIncomingCall, { decimals: 3 })} />
-              <MiniMetric label="Cost / AI minute" value={gbp(result.costPerAiMinute, { decimals: 3 })} accent="signal" />
               <MiniMetric label="Cost / telephony min" value={gbp(result.costPerTelephonyMinute, { decimals: 3 })} />
               <MiniMetric label="Cost / resolved" value={gbp(result.costPerResolvedCall, { decimals: 3 })} accent="signal" />
               <MiniMetric label="Peak concurrency" value={num(result.volumes.peakConcurrentCalls)} accent="amber" />

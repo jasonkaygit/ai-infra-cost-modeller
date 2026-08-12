@@ -36,9 +36,9 @@ test("concurrency: peak > average and both positive", () => {
 test("INVARIANT: escalated calls still incur AI cost (AI minutes include escalated leg)", () => {
   const ctx = buildUsageContext(scenario);
   const v = ctx.volumes;
-  // AI minutes must exceed contained-only minutes because escalated calls add AI time.
-  const containedOnly = v.resolvedCalls * scenario.callProfile.aiDurationForResolvedCallMin;
-  assert.ok(ctx.drivers.AI_MINUTES > containedOnly);
+  // AI minutes must exceed resolved-only minutes because escalated calls add AI time.
+  const resolvedOnly = v.resolvedCalls * (scenario.callProfile.averageCallDurationMin * 4 / 6);
+  assert.ok(ctx.drivers.AI_MINUTES > resolvedOnly);
 });
 
 test("INVARIANT: telephony minutes include both AI and human legs for escalations", () => {
@@ -87,17 +87,17 @@ test("only the selected supplier's voice component is included", () => {
   assert.equal(voiceLines[0].componentId, "voice-a-percall");
 });
 
-test("baseline cost: simple mode = per-contact × volume", () => {
-  assert.equal(computeBaselineCost(scenario.baseline), 4.2 * 25_000_000);
+test("baseline cost: simple mode = per-minute × handle-time × volume", () => {
+  assert.ok(Math.abs(computeBaselineCost(scenario.baseline) - 0.70 * 7 * 25_000_000) < 1);
 });
 
 test("ROI: net benefit and payback formulas", () => {
   const future = 10_000_000;
   const roi = computeROI(scenario, future);
-  const baseline = 4.2 * 25_000_000; // 105,000,000
+  const baseline = Math.round(0.70 * 7 * 25_000_000); // 122,500,000
   assert.equal(roi.baselineAnnualCost, baseline);
-  assert.equal(roi.grossAvoidedCost, baseline - future);
-  assert.equal(roi.netBenefit, baseline - future - scenario.investment);
+  assert.ok(Math.abs(roi.grossAvoidedCost - (baseline - future)) < 1);
+  assert.ok(Math.abs(roi.netBenefit - (baseline - future - scenario.investment)) < 1);
   assert.ok(roi.roiPercentage > 0);
   // Very fast payback: 150k / 95m ≈ 0.0016 yr, rounds to a small non-negative value.
   assert.ok(roi.paybackPeriodYears >= 0 && roi.paybackPeriodYears < 1);

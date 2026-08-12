@@ -103,26 +103,26 @@ export function buildUsageContext(
   const reasoningTokens = v.aiCalls * ai.avgReasoningTokensPerInteraction * ai.llmCallsPerConversation;
   const totalTokens = inputTokens + outputTokens + reasoningTokens;
 
-  // AI minutes: contained calls spend containment duration; escalated calls
-  // spend the pre-escalation duration. Both incur AI cost.
+  // Derive sub-durations from average call duration using fixed ratios.
+  // Resolved call: ~67% of avg (AI-only), handoff: ~33% AI + 117% human.
+  const aiResolvedMin = cp.averageCallDurationMin * (4 / 6);
+  const aiHandoffMin = cp.averageCallDurationMin * (2 / 6);
+  const humanHandoffMin = cp.averageCallDurationMin * (7 / 6);
+
+  // AI minutes: resolved calls spend full AI time; escalated/abandoned/failed
+  // spend only the pre-handoff AI time.
   const aiMinutes =
-    v.resolvedCalls * cp.aiDurationForResolvedCallMin +
-    v.escalatedCalls * cp.aiDurationBeforeHandoffMin +
-    (v.abandonedCalls + v.failedCalls) * cp.aiDurationBeforeHandoffMin;
+    v.resolvedCalls * aiResolvedMin +
+    (v.escalatedCalls + v.abandonedCalls + v.failedCalls) * aiHandoffMin;
 
-  // Human minutes after escalation. AHT reduction from AI pre-processing applies
-  // ONLY to escalated calls (AI handed off to human). Calls never offered to AI
-  // and failed calls get the full human duration with no reduction.
-  // residualHuman = notOffered + escalated + failed, so:
-  // (residualHuman - escalated) = notOffered + failed
+  // Human minutes: AHT reduction applies only to escalated calls.
+  // (residualHuman - escalated) = notOffered + failed → full duration, no AI benefit.
   const humanMinutes =
-    (v.residualHumanCalls - v.escalatedCalls) * cp.humanDurationAfterHandoffMin +
-    v.escalatedCalls *
-      cp.humanDurationAfterHandoffMin *
-      (1 - clamp01(outcome.ahtReductionAfterTransfer));
+    (v.residualHumanCalls - v.escalatedCalls) * humanHandoffMin +
+    v.escalatedCalls * humanHandoffMin * (1 - clamp01(outcome.ahtReductionAfterTransfer));
 
-  // Telephony minutes: AI leg + human leg for escalated calls carry telephony.
-  const telephonyMinutes = aiMinutes + v.escalatedCalls * cp.humanDurationAfterHandoffMin;
+  // Telephony minutes: AI leg + human leg for escalated calls.
+  const telephonyMinutes = aiMinutes + v.escalatedCalls * humanHandoffMin;
 
   // Storage GB-months (steady state): retained volume averaged over retention window.
   const audioGbPerCall = cp.averageCallDurationMin * st.audioMbPerMinute * GB_PER_MB;
