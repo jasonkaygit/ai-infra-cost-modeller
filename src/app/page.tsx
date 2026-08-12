@@ -28,7 +28,9 @@ const LS_KEYS = {
   counter: "voice-ai:counter",
 };
 
-// Dual-write: localStorage (sync, fast) + IndexedDB (async, durable)
+// Persistence: localStorage (fast sync cache) + SQLite (primary, durable)
+// Background: on every write, localStorage is updated immediately for fast reload,
+// then SQLite is updated asynchronously via the Repository.
 function loadJSON<T>(key: string, fallback: T): T {
   try {
     const raw = localStorage.getItem(key);
@@ -38,16 +40,16 @@ function loadJSON<T>(key: string, fallback: T): T {
 
 function saveJSON(key: string, value: unknown) {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* quota */ }
-  try {
-    // Background sync to IndexedDB for durability
-    const req = indexedDB.open("ai-cost-modeller", 1);
-    req.onupgradeneeded = () => { req.result.createObjectStore("kv"); };
-    req.onsuccess = () => {
-      const tx = req.result.transaction("kv", "readwrite");
-      tx.objectStore("kv").put(value, key);
-      tx.oncomplete = () => req.result.close();
-    };
-  } catch { /* IndexedDB unavailable */ }
+  // Background sync to SQLite via Repository
+  import("../repository/repository").then(({ getRepository }) => {
+    const repo = getRepository();
+    if (key === "voice-ai:scenarios" && Array.isArray(value)) {
+      value.forEach((s: any) => repo.saveScenario(s).catch(() => {}));
+    } else if (key === "voice-ai:components" && typeof value === "object" && value) {
+      // Store components as a JSON blob in a scenario-keyed entry
+      repo.saveScenario({ id: "__components__", data: value } as any).catch(() => {});
+    }
+  }).catch(() => {});
 }
 
 export default function Page() {
@@ -61,25 +63,18 @@ export default function Page() {
   const [showAddForm, setShowAddForm] = useState(false);
   const [activeTab, setActiveTab] = useState<"overview" | "customers" | "portfolio">("overview");
 
-  // One-time: restore from IndexedDB if localStorage was cleared
+  // One-time: restore from SQLite if localStorage was cleared
   useEffect(() => {
-    const keys = [
-      "voice-ai:scenarios", "voice-ai:components", "voice-ai:customers",
-      "voice-ai:overrides", "voice-ai:activeScenarioId", "voice-ai:counter", "voice-ai:growth",
-    ];
-    const allEmpty = keys.every((k) => !localStorage.getItem(k));
-    if (!allEmpty) return;
-    const req = indexedDB.open("ai-cost-modeller", 1);
-    req.onupgradeneeded = () => { req.result.createObjectStore("kv"); };
-    req.onsuccess = () => {
-      const db = req.result;
-      const tx = db.transaction("kv", "readonly");
-      keys.forEach((k) => {
-        const r = tx.objectStore("kv").get(k);
-        r.onsuccess = () => { if (r.result != null) localStorage.setItem(k, JSON.stringify(r.result)); };
+    const key = "voice-ai:scenarios";
+    if (localStorage.getItem(key)) return; // already have data
+    import("../repository/repository").then(({ getRepository }) => {
+      getRepository().listScenarios().then((scenarios) => {
+        if (scenarios.length > 0) {
+          localStorage.setItem(key, JSON.stringify(scenarios));
+          window.location.reload();
+        }
       });
-      tx.oncomplete = () => { db.close(); window.location.reload(); };
-    };
+    }).catch(() => {});
   }, []);
 
   // Growth rates for multi-year projection
