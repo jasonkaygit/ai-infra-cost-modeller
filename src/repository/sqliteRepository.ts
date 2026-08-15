@@ -11,7 +11,9 @@ let initPromise: Promise<any> | null = null;
 async function getSQL() {
   if (!initPromise) {
     initPromise = import("sql.js").then(async (m) => {
-      const SQL = await m.default();
+      const SQL = await m.default({
+        locateFile: () => "/sql-wasm-browser.wasm",
+      });
       return SQL;
     });
   }

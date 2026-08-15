@@ -140,26 +140,11 @@ function evaluateRule(
         units = rule.scaling.manualUnits;
         traceUnits = `${units} (manual)`;
       } else {
-        const profile = ctx.concurrencyProfile;
-        if (profile && profile.length === 24) {
-          // Time-weighted average: compute nodes needed per hour, average across 24h.
-          const cap = Math.max(1e-9, rule.scaling.capacityPerUnit);
-          let totalUnits = 0;
-          for (let h = 0; h < 24; h++) {
-            totalUnits += Math.max(
-              rule.scaling.minUnits,
-              Math.ceil(profile[h] / cap)
-            );
-          }
-          units = Math.max(rule.scaling.minUnits, Math.round(totalUnits / 24));
-          traceUnits = `profile avg: ceil(hourly/cap)/24 = ${units} unit(s)`;
-        } else {
-          const demand = ctx.drivers[rule.scaling.capacityDriver] ?? 0;
-          units = Math.ceil(demand / Math.max(1e-9, rule.scaling.capacityPerUnit));
-          units = Math.max(rule.scaling.minUnits, units);
-          if (rule.scaling.maxUnits != null) units = Math.min(rule.scaling.maxUnits, units);
-          traceUnits = `ceil(${fmtN(demand)}/${rule.scaling.capacityPerUnit})=${units} unit(s)`;
-        }
+        const demand = ctx.drivers[rule.scaling.capacityDriver] ?? 0;
+        units = Math.ceil(demand / Math.max(1e-9, rule.scaling.capacityPerUnit));
+        units = Math.max(rule.scaling.minUnits, units);
+        if (rule.scaling.maxUnits != null) units = Math.min(rule.scaling.maxUnits, units);
+        traceUnits = `ceil(${fmtN(demand)}/${rule.scaling.capacityPerUnit})=${units} unit(s)`;
       }
       // unitPrice is monthly per unit → annualise.
       const annual = money(rule.unitPrice * units * 12, currency);

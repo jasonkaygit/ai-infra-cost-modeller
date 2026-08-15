@@ -315,6 +315,10 @@ export interface Scenario {
   investment: number;
   /** DR overhead as percentage of infrastructure cost (0 = no DR, 40 = warm standby, 60 = hot standby) */
   drOverheadPct: number;
+  /** Pre-prod/dev overhead as percentage of infrastructure cost */
+  preprodOverheadPct: number;
+  /** Staging overhead as percentage of infrastructure cost */
+  stagingOverheadPct: number;
   /** component enable/disable overrides by id */
   disabledComponentIds: string[];
   createdAt: string;

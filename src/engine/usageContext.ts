@@ -103,11 +103,11 @@ export function buildUsageContext(
   const reasoningTokens = v.aiCalls * ai.avgReasoningTokensPerInteraction * ai.llmCallsPerConversation;
   const totalTokens = inputTokens + outputTokens + reasoningTokens;
 
-  // Derive sub-durations from average call duration using fixed ratios.
-  // Resolved call: ~67% of avg (AI-only), handoff: ~33% AI + 117% human.
-  const aiResolvedMin = cp.averageCallDurationMin * (4 / 6);
-  const aiHandoffMin = cp.averageCallDurationMin * (2 / 6);
-  const humanHandoffMin = cp.averageCallDurationMin * (7 / 6);
+  // Keep duration assumptions simple and auditable: resolved AI calls consume the
+  // full average call duration; escalations consume a shorter AI leg plus a human leg.
+  const aiResolvedMin = cp.averageCallDurationMin;
+  const aiHandoffMin = cp.averageCallDurationMin * 0.5;
+  const humanHandoffMin = cp.averageCallDurationMin;
 
   // AI minutes: resolved calls spend full AI time; escalated/abandoned/failed
   // spend only the pre-handoff AI time.

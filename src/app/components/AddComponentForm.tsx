@@ -7,7 +7,6 @@ import type {
   PricingModel,
   UsageDriver,
   FixedVariableClass,
-  Environment,
   Frequency,
   PricingRule,
 } from "../../domain/types";
@@ -98,7 +97,6 @@ const CLASSIFICATIONS: FixedVariableClass[] = [
   "ONE_OFF",
 ];
 
-const ENVIRONMENTS: Environment[] = ["PROD", "NON_PROD", "SHARED"];
 const FREQUENCIES: Frequency[] = ["MONTHLY", "ANNUAL", "ONE_OFF"];
 
 function defaultPricing(model: PricingModel): PricingRule {
@@ -142,7 +140,6 @@ export function AddComponentForm({
   const [description, setDescription] = useState("");
   const [usageDriver, setUsageDriver] = useState<UsageDriver>("NONE");
   const [classification, setClassification] = useState<FixedVariableClass>("FIXED");
-  const [environment, setEnvironment] = useState<Environment>("PROD");
   const [frequency, setFrequency] = useState<Frequency>("MONTHLY");
   const [assumptions, setAssumptions] = useState("");
 
@@ -167,7 +164,7 @@ export function AddComponentForm({
         description: description.trim() || service.trim(),
         usageDriver,
         classification,
-        environment,
+        environment: "PROD",
         frequency,
         pricing,
         assumptions,
@@ -177,7 +174,7 @@ export function AddComponentForm({
     },
     [
       category, provider, service, description, usageDriver,
-      classification, environment, frequency, pricing, assumptions, onAdd,
+      classification, frequency, pricing, assumptions, onAdd,
     ]
   );
 
@@ -243,15 +240,6 @@ export function AddComponentForm({
           <select value={classification} onChange={(e) => setClassification(e.target.value as FixedVariableClass)} className="input">
             {CLASSIFICATIONS.map((c) => (
               <option key={c} value={c}>{c.replace("_", "-")}</option>
-            ))}
-          </select>
-        </Field>
-
-        {/* Environment */}
-        <Field label="Environment">
-          <select value={environment} onChange={(e) => setEnvironment(e.target.value as Environment)} className="input">
-            {ENVIRONMENTS.map((env) => (
-              <option key={env} value={env}>{env.replace("_", " ")}</option>
             ))}
           </select>
         </Field>

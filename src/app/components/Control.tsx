@@ -87,7 +87,7 @@ export function Slider({
         aria-label={label}
       />
       {description && (
-        <p className="mt-1 text-[10px] leading-relaxed text-ink/70">{description}</p>
+        <p className="mt-1 text-[10px] leading-relaxed text-ink/90">{description}</p>
       )}
     </div>
   );

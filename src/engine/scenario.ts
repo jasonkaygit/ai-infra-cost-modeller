@@ -14,14 +14,40 @@ import { buildUsageContext } from "./usageContext";
 /** Baseline (pre-AI) annual cost of the contact centre. */
 export function computeBaselineCost(baseline: HumanContactCentreBaseline): number {
   if (baseline.mode === "SIMPLE_COST_PER_CONTACT") {
-    // If per-minute cost is set, derive per-contact from it
     if (baseline.baselineCostPerMinute > 0) {
       return baseline.baselineCostPerMinute * baseline.currentAverageHandleTimeMin * baseline.currentAnnualCallVolume;
     }
     return baseline.simpleCurrentCostPerContact * baseline.currentAnnualCallVolume;
   }
-  // Workforce model: fully loaded agent cost × number of agents.
   return baseline.fullyLoadedAgentAnnualCost * baseline.numberOfAgents;
+}
+
+/**
+ * Concurrency-driven baseline: uses the profile to determine what fraction of
+ * daily concurrency falls within human operating hours, then applies that
+ * fraction to the total call volume × duration to get human minutes.
+ */
+export function computeBaselineFromProfile(
+  profile: number[] | undefined,
+  humanHoursPerDay: number,
+  costPerMinute: number,
+  annualCallVolume: number,
+  averageCallDurationMin: number,
+  fallback: number
+): number {
+  if (!profile || profile.length !== 24) return fallback;
+  // Fraction of daily concurrency that falls within human operating hours
+  let totalConcurrency = 0;
+  let humanConcurrency = 0;
+  for (let h = 0; h < 24; h++) {
+    totalConcurrency += profile[h];
+    if (h >= 8 && h < 8 + humanHoursPerDay) humanConcurrency += profile[h];
+  }
+  const humanFraction = totalConcurrency > 0 ? humanConcurrency / totalConcurrency : 1;
+  // Human minutes = calls that land during human hours × duration
+  const humanCalls = Math.round(annualCallVolume * humanFraction);
+  const humanMinutesPerYear = humanCalls * averageCallDurationMin;
+  return humanMinutesPerYear * costPerMinute;
 }
 
 export function computeROI(

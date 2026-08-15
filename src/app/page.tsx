@@ -5,8 +5,6 @@ import { SEED_COMPONENTS, SEED_SUPPLIERS, SEED_SCENARIOS } from "../data/seed";
 import { computeScenarioResult } from "../engine/scenario";
 import { buildUsageContext } from "../engine/usageContext";
 import type { Scenario, CostComponent, UsageDriver, Customer } from "../domain/types";
-import { CostWaterfall } from "./components/CostWaterfall";
-import { FixedVariableSplit } from "./components/FixedVariableSplit";
 import { BreakdownTable } from "./components/BreakdownTable";
 import { Slider } from "./components/Control";
 import { DriverOverrides } from "./components/DriverOverrides";
@@ -27,6 +25,12 @@ const LS_KEYS = {
   activeScenarioId: "voice-ai:activeScenarioId",
   counter: "voice-ai:counter",
 };
+
+const OPERATING_MODEL_PRESETS = [
+  { label: "Lean", dr: 0, preprod: 10, staging: 0, evaluation: 0.05 },
+  { label: "Standard", dr: 35, preprod: 15, staging: 15, evaluation: 0.1 },
+  { label: "Gov-ready", dr: 60, preprod: 20, staging: 20, evaluation: 0.25 },
+] as const;
 
 // Persistence: localStorage (fast sync cache) + SQLite (primary, durable)
 // Background: on every write, localStorage is updated immediately for fast reload,
@@ -67,16 +71,27 @@ function saveJSON(key: string, value: unknown) {
     },
   });
 
+  const seedScenarioIds = new Set(SEED_SCENARIOS.map((s) => s.id));
+  const latestSeedScenario = (id: string) => SEED_SCENARIOS.find((s) => s.id === id);
+
 export default function Page() {
   const [scenario, setScenario] = useState<Scenario>(() => {
     const saved = loadJSON<Scenario | null>(LS_KEYS.activeScenarioId, null);
-    if (saved) return ensureProfile(saved);
+    if (saved) {
+      const latestSeed = latestSeedScenario(saved.id);
+      return ensureProfile(latestSeed ? { ...latestSeed } : saved);
+    }
     return ensureProfile({ ...SEED_SCENARIOS[0] });
   });
-  const [waterfallMode, setWaterfallMode] = useState<"total" | "perCall">("total");
   const [showBreakdown, setShowBreakdown] = useState(true);
   const [showAddForm, setShowAddForm] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const [activeTab, setActiveTab] = useState<"overview" | "customers" | "portfolio">("overview");
+  const [hasHydrated, setHasHydrated] = useState(false);
+
+  useEffect(() => {
+    setHasHydrated(true);
+  }, []);
 
   // One-time: restore from SQLite if localStorage was cleared
   useEffect(() => {
@@ -109,9 +124,14 @@ export default function Page() {
   useEffect(() => { saveJSON(LS_KEYS.activeScenarioId, scenario); }, [scenario]);
 
   // Scenarios — apply patches for fields added after initial save
-  const [scenarios, setScenarios] = useState<Scenario[]>(() =>
-    loadJSON(LS_KEYS.scenarios, SEED_SCENARIOS.map((s) => ensureProfile({ ...s }))).map(ensureProfile)
-  );
+  const [scenarios, setScenarios] = useState<Scenario[]>(() => {
+    const saved = loadJSON<Scenario[] | null>(LS_KEYS.scenarios, null);
+    const customScenarios = (saved ?? []).filter((s) => !seedScenarioIds.has(s.id));
+    return [
+      ...SEED_SCENARIOS.map((s) => ensureProfile({ ...s })),
+      ...customScenarios.map(ensureProfile),
+    ];
+  });
   const counterData = loadJSON<{ scenario: number; customer: number }>(LS_KEYS.counter, { scenario: SEED_SCENARIOS.length, customer: 0 });
   const scenarioIdCounter = useRef(Math.max(SEED_SCENARIOS.length, counterData.scenario));
 
@@ -160,14 +180,32 @@ export default function Page() {
   const cloneComponents = (src: CostComponent[]) =>
     src.map((c) => ({
       ...c,
-      pricing: { ...c.pricing, tiers: c.pricing.tiers?.map((t) => ({ ...t })) },
+      pricing: {
+        ...c.pricing,
+        tiers: c.pricing.tiers?.map((t) => ({ ...t })),
+        scaling: c.pricing.scaling ? { ...c.pricing.scaling } : undefined,
+      },
     }));
+
+  const mergeSeedComponents = (current: CostComponent[]) => {
+    const currentIds = new Set(current.map((c) => c.id));
+    const missingSeedComponents = SEED_COMPONENTS.filter((c) => !currentIds.has(c.id));
+    return missingSeedComponents.length === 0
+      ? current
+      : [...current, ...cloneComponents(missingSeedComponents)];
+  };
 
   const [componentSnapshots, setComponentSnapshots] = useState<
     Record<string, CostComponent[]>
   >(() => {
     const saved = loadJSON<Record<string, CostComponent[]> | null>(LS_KEYS.components, null);
-    if (saved && Object.keys(saved).length > 0) return saved;
+    if (saved && Object.keys(saved).length > 0) {
+      const next = { ...saved };
+      for (const s of SEED_SCENARIOS) {
+        next[s.id] = cloneComponents(SEED_COMPONENTS);
+      }
+      return next;
+    }
     const init: Record<string, CostComponent[]> = {};
     for (const s of SEED_SCENARIOS) {
       init[s.id] = cloneComponents(SEED_COMPONENTS);
@@ -177,11 +215,12 @@ export default function Page() {
 
   useEffect(() => { saveJSON(LS_KEYS.components, componentSnapshots); }, [componentSnapshots]);
 
-  const components =
-    componentSnapshots[scenario.id] ?? cloneComponents(SEED_COMPONENTS);
+  const components = useMemo(
+    () => mergeSeedComponents(componentSnapshots[scenario.id] ?? cloneComponents(SEED_COMPONENTS)),
+    [componentSnapshots, scenario.id]
+  );
 
-  const defaultSupplier = SEED_SUPPLIERS[0];
-  const supplier = defaultSupplier;
+  const supplier = SEED_SUPPLIERS.find((s) => s.id === scenario.supplierId) ?? SEED_SUPPLIERS[0];
 
   const [driverOverrides, setDriverOverrides] = useState<Partial<Record<UsageDriver, number>>>(
     () => loadJSON(LS_KEYS.overrides, {})
@@ -193,33 +232,39 @@ export default function Page() {
   // Pass 1: compute result without DR to get the base infrastructure cost.
   // Pass 2: set DR unit price = preDR total × drPct, compute final result.
   const drPct = (scenario.drOverheadPct ?? 0) / 100;
-  const componentsWithoutDR = useMemo(
+  // Overhead components set to zero for base calculation
+  const overheadIds = ["dr-overhead", "preprod-overhead", "staging-overhead"];
+  const componentsWithoutOverhead = useMemo(
     () =>
       components.map((c) =>
-        c.id === "dr-overhead" ? { ...c, pricing: { ...c.pricing, unitPrice: 0 } } : c
+        overheadIds.includes(c.id) ? { ...c, pricing: { ...c.pricing, unitPrice: 0 } } : c
       ),
     [components]
   );
 
-  const preDRResult = useMemo(
-    () => computeScenarioResult(scenario, supplier, componentsWithoutDR, driverOverrides),
-    [scenario, supplier, componentsWithoutDR, driverOverrides]
+  const preOverheadResult = useMemo(
+    () => computeScenarioResult(scenario, supplier, componentsWithoutOverhead, driverOverrides),
+    [scenario, supplier, componentsWithoutOverhead, driverOverrides]
   );
 
-  const componentsWithDR = useMemo(
-    () =>
-      drPct > 0
-        ? components.map((c) =>
-            c.id === "dr-overhead"
-              ? {
-                  ...c,
-                  pricing: { ...c.pricing, unitPrice: (preDRResult.breakdown.totalAnnual * drPct) / 12 },
-                }
-              : c
-          )
-        : components,
-    [components, drPct, preDRResult.breakdown.totalAnnual]
-  );
+  const stagingPct = (scenario.stagingOverheadPct ?? 0) / 100;
+  const preprodPct = (scenario.preprodOverheadPct ?? 0) / 100;
+  const componentsWithOverhead = useMemo(() => {
+    const base = preOverheadResult.breakdown.totalAnnual;
+    return components.map((c) => {
+      if (c.id === "dr-overhead" && drPct > 0)
+        return { ...c, pricing: { ...c.pricing, unitPrice: (base * drPct) / 12 } };
+      if (c.id === "preprod-overhead" && preprodPct > 0)
+        return { ...c, pricing: { ...c.pricing, unitPrice: (base * preprodPct) / 12 } };
+      if (c.id === "staging-overhead" && stagingPct > 0)
+        return { ...c, pricing: { ...c.pricing, unitPrice: (base * stagingPct) / 12 } };
+      return c;
+    });
+  }, [components, drPct, preprodPct, stagingPct, preOverheadResult.breakdown.totalAnnual]);
+
+  // Keep old names for remaining references
+  const componentsWithoutDR = componentsWithoutOverhead;
+  const componentsWithDR = componentsWithOverhead;
 
   const result = useMemo(
     () => computeScenarioResult(scenario, supplier, componentsWithDR, driverOverrides),
@@ -265,16 +310,7 @@ export default function Page() {
     }[];
   }, [customers, scenarios, supplier, componentsWithoutDR, driverOverrides]);
 
-  // Off-hours percentage: fraction of concurrency outside human operating hours
-  // Assumes human shift starts at hour 8 (8am). Hours outside [8, 8+humanHours) are off-hours.
   const profile = scenario.callProfile.concurrencyProfile ?? DEFAULT_CONCURRENCY;
-  const humanHours = scenario.callProfile.humanOperatingHoursPerDay ?? 14;
-  let offHoursSum = 0; let totalSum = 0;
-  for (let h = 0; h < 24; h++) {
-    totalSum += profile[h];
-    if (h < 8 || h >= 8 + humanHours) offHoursSum += profile[h];
-  }
-  const offHoursPct = totalSum > 0 ? Math.round((offHoursSum / totalSum) * 100) : 0;
 
   const combinedPeak = Math.max(...profile, 1);
   const combinedTCO = portfolio.reduce((s, p) => s + p.totalWithDR, 0);
@@ -293,7 +329,7 @@ export default function Page() {
       const activeProf = scenario.callProfile.concurrencyProfile;
       const customers = portfolio.map(({ customer, scenario: custScenario }) => {
         const vol = Math.round(custScenario.callProfile.annualIncomingCalls * factor);
-        const res = Math.min(0.95, custScenario.outcome.resolutionRate + resPts);
+        const res = Math.min(1, custScenario.outcome.resolutionRate + resPts);
         const bl = custScenario.baseline.simpleCurrentCostPerContact * inflation;
         const cp = customer.concurrencyProfile ?? custScenario.callProfile.concurrencyProfile ?? activeProf;
         const scen: Scenario = {
@@ -329,7 +365,7 @@ export default function Page() {
       const scen: Scenario = {
         ...scenario,
         callProfile: { ...scenario.callProfile, annualIncomingCalls: Math.round(vol) },
-        outcome: { ...scenario.outcome, resolutionRate: Math.min(0.95, res) },
+          outcome: { ...scenario.outcome, resolutionRate: Math.min(1, res) },
         baseline: { ...scenario.baseline, simpleCurrentCostPerContact: bl, currentAnnualCallVolume: Math.round(vol) },
       };
       const r = computeScenarioResult(scen, supplier, componentsWithoutDR, driverOverrides);
@@ -412,12 +448,12 @@ export default function Page() {
     (id: string, patch: Partial<CostComponent>) => {
       setComponentSnapshots((prev) => ({
         ...prev,
-        [scenario.id]: (prev[scenario.id] ?? []).map((c) =>
+        [scenario.id]: components.map((c) =>
           c.id === id ? { ...c, ...patch } : c
         ),
       }));
     },
-    [scenario.id]
+    [components, scenario.id]
   );
 
   const deleteComponent = useCallback(
@@ -485,7 +521,7 @@ export default function Page() {
                   : "text-muted hover:text-ink"
               }`}
             >
-              {tab === "overview" ? "Scenario" : tab === "customers" ? `Customers${customers.length > 0 ? ` (${customers.length})` : ""}` : "Portfolio"}
+              {tab === "overview" ? "Scenario" : tab === "customers" ? `Customers${hasHydrated && customers.length > 0 ? ` (${customers.length})` : ""}` : "Portfolio"}
             </button>
           ))}
         </div>
@@ -515,245 +551,59 @@ export default function Page() {
                 onDelete={handleDeleteScenario}
               />
             </div>
-            <div className="rounded-2xl border hairline bg-panel p-5">
-              <SectionLabel n="DR" title="Disaster recovery" />
-              <Slider
-                label="DR overhead"
-                description="Disaster recovery cost as a percentage of total infrastructure. 30–50% = pilot light, 50–80% = warm standby, 80–100% = active-active."
-                min={0}
-                max={100}
-                step={5}
-                value={scenario.drOverheadPct ?? 0}
-                onChange={(v) =>
-                  setScenario((s) => ({ ...s, drOverheadPct: v }))
-                }
-                format={(v) => (v === 0 ? "none" : `${v}% of infra`)}
-              />
-              <p className="mt-2 text-[10px] text-faint">
-                0% = no DR · 30–50% = pilot light · 50–80% = warm standby · 80–100% = hot standby / active-active
+          </div>
+        </section>
+
+        <section className="mt-8">
+          <ExecutiveForecast
+            scenario={scenario}
+            result={result}
+            components={components}
+            onUpdateComponent={updateComponent}
+            onScenarioChange={setScenario}
+            onCallChange={setCall}
+          />
+        </section>
+
+        <section className="mt-8">
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border hairline bg-panel p-5">
+            <div>
+              <SectionLabel n="AD" title="Advanced audit" inline />
+              <p className="mt-2 max-w-3xl text-sm text-muted">
+                Component pricing, usage-driver overrides, capacity tuning and architecture diagrams are kept
+                available for audit and supplier validation.
               </p>
             </div>
+            <button
+              onClick={() => setShowAdvanced((v) => !v)}
+              className={`figure rounded-lg border px-4 py-2 text-xs transition-colors ${
+                showAdvanced
+                  ? "border-signal bg-signal text-ground"
+                  : "hairline bg-panel2 text-muted hover:text-ink"
+              }`}
+            >
+              {showAdvanced ? "hide advanced" : "show advanced"}
+            </button>
           </div>
         </section>
 
-        {/* Sensitivity + Executive metrics side by side */}
-        <section className="mt-8 grid grid-cols-1 gap-6 lg:grid-cols-[1fr_1.4fr]">
-          <div className="rounded-2xl border hairline bg-panel p-5">
-            <SectionLabel n="01" title="Sensitivity" />
-            <div className="space-y-5">
-              <Slider
-                label="Baseline cost per minute"
-                description="Current fully-loaded human agent cost per minute. UK onshore ~£0.70, offshore BPO ~£0.10. Multiplied by call duration to get per-contact baseline."
-                min={0.01}
-                max={2}
-                step={0.01}
-                value={scenario.baseline.baselineCostPerMinute}
-                onChange={(v) =>
-                  setScenario((s) => ({
-                    ...s,
-                    baseline: {
-                      ...s.baseline,
-                      baselineCostPerMinute: v,
-                      simpleCurrentCostPerContact: v * s.callProfile.averageCallDurationMin,
-                    },
-                  }))
-                }
-                format={(v) => `£${v.toFixed(2)}/min`}
-              />
-              <Slider
-                label="Annual incoming calls"
-                description="Total calls handled per year across all channels. Drives every volume-based cost."
-                min={1_000_000}
-                max={200_000_000}
-                step={1_000_000}
-                value={scenario.callProfile.annualIncomingCalls}
-                onChange={(v) =>
-                  setScenario((s) => ({
-                    ...s,
-                    callProfile: { ...s.callProfile, annualIncomingCalls: v },
-                    baseline: { ...s.baseline, currentAnnualCallVolume: v },
-                  }))
-                }
-                format={(v) => num(v)}
-              />
-              <Slider
-                label="Human operating hours"
-                description="Hours per day the contact centre is staffed. Calls outside these hours are forced to AI (no human agents available). 24 = round-the-clock staffing."
-                min={8}
-                max={24}
-                step={1}
-                value={scenario.callProfile.humanOperatingHoursPerDay ?? 14}
-                onChange={(v) =>
-                  setScenario((s) => ({
-                    ...s,
-                    callProfile: { ...s.callProfile, humanOperatingHoursPerDay: v },
-                  }))
-                }
-                format={(v) => `${v}h/day`}
-              />
-              <Slider
-                label="Average call duration"
-                description="How long the average call lasts, including AI and human legs. Longer calls = more telephony, AI minutes, and storage."
-                min={1}
-                max={20}
-                step={0.5}
-                value={scenario.callProfile.averageCallDurationMin}
-                onChange={(v) =>
-                  setScenario((s) => ({
-                    ...s,
-                    callProfile: { ...s.callProfile, averageCallDurationMin: v },
-                    baseline: {
-                      ...s.baseline,
-                      currentAverageHandleTimeMin: v,
-                      simpleCurrentCostPerContact: s.baseline.baselineCostPerMinute * v,
-                    },
-                  }))
-                }
-                format={(v) => `${v} min`}
-              />
-              <Slider
-                label="AI resolution"
-                description="% of ALL incoming calls fully resolved by AI end-to-end. 100% adoption is assumed — every call goes through AI first. The rest escalate to human (25–70%) or are abandoned/failed (5% fixed)."
-                min={0}
-                max={0.95}
-                step={0.01}
-                value={scenario.outcome.resolutionRate}
-                onChange={(v) =>
-                  setScenario((s) => ({
-                    ...s,
-                    outcome: {
-                      ...s.outcome,
-                      aiAdoptionPercentage: 1,
-                      resolutionRate: v,
-                      escalationRate: Math.max(0, 1 - v - 0.03 - 0.02),
-                    },
-                  }))
-                }
-                format={(v) => pct(v)}
-              />
-              <Slider
-                label="Calls automatically evaluated"
-                description="Percentage of AI calls sampled for quality evaluation. Higher = more assurance but more eval LLM tokens and storage cost."
-                min={0}
-                max={1}
-                step={0.01}
-                value={scenario.evaluation.autoEvaluatedPercentage}
-                onChange={(v) =>
-                  setScenario((s) => ({ ...s, evaluation: { ...s.evaluation, autoEvaluatedPercentage: v } }))
-                }
-                format={(v) => pct(v, v < 0.1 ? 1 : 0)}
-              />
-              <Slider
-                label="Year 1 ramp"
-                description="How many months to linearly ramp from 0 to full volume. 0 = instant (100%), 6 = 75% effective vol, 12 = 50% effective vol. Fixed/stepped costs are not scaled."
-                min={0}
-                max={12}
-                step={1}
-                value={scenario.callProfile.yearOneRampMonths ?? 0}
-                onChange={(v) => setCall({ yearOneRampMonths: v })}
-                format={(v) => (v === 0 ? "instant" : `${v} months`)}
-              />
-              <Slider
-                label="EC2 Nitro inference nodes"
-                description="Dedicated inference servers for agent orchestration. Set to 0 = auto-scale from concurrency profile (shows computed count). Drag to override."
-                min={0}
-                max={5000}
-                step={1}
-                value={
-                  components.find((c) => c.id === "ec2-nitro-inference")?.pricing.scaling
-                    ?.manualUnits ?? 0
-                }
-                onChange={(v) =>
-                  updateComponent("ec2-nitro-inference", {
-                    pricing: {
-                      ...components.find((c) => c.id === "ec2-nitro-inference")!.pricing,
-                      scaling: {
-                        ...components.find((c) => c.id === "ec2-nitro-inference")!.pricing.scaling!,
-                        manualUnits: v === 0 ? undefined : v,
-                      },
-                    },
-                  })
-                }
-                format={(() => {
-                  const computed = result.breakdown.lines.find(
-                    (l) => l.componentId === "ec2-nitro-inference"
-                  )?.usageQuantity ?? 0;
-                  return (v: number) =>
-                    v > 0
-                      ? `${v} nodes (manual)`
-                      : `auto (${computed.toLocaleString()} nodes)`;
-                })()}
-              />
-            </div>
-          </div>
-
-          <div className="rounded-2xl border hairline bg-panel p-5">
-            <SectionLabel n="02" title="Executive metrics" />
-            <div className="grid grid-cols-2 gap-2">
-              <MiniMetric label="Annual calls" value={num(result.volumes.annualIncomingCalls)} />
-              <MiniMetric label="AI calls" value={num(result.volumes.aiCalls)} accent="signal" />
-              <MiniMetric label="Resolved" value={num(result.volumes.resolvedCalls)} accent="signal" />
-              <MiniMetric label="Human escalations" value={num(result.volumes.escalatedCalls)} accent="violet" />
-              <MiniMetric label="TCO /yr" value={gbp(result.breakdown.totalAnnual, { compact: true })} accent="coral" />
-              <MiniMetric label="Cost / AI minute" value={gbp(result.costPerAiMinute, { decimals: 3 })} accent="signal" />
-              <MiniMetric
-                label="Baseline cost/min"
-                value={`£${(scenario.baseline.baselineCostPerMinute ?? 0.70).toFixed(2)}`}
-                sub={`per-contact £${(scenario.baseline.simpleCurrentCostPerContact ?? 4.20).toFixed(2)}`}
-              />
-              <MiniMetric label="Net benefit" value={gbp(result.roi.netBenefit, { compact: true })} accent={result.roi.netBenefit >= 0 ? "signal" : "coral"} />
-              <MiniMetric
-                label="Baseline (pre-AI)"
-                value={gbp(result.roi.baselineAnnualCost, { compact: true })}
-              />
-              <MiniMetric label="DR overhead" value={gbp((scenario.drOverheadPct ?? 0) > 0 ? preDRResult.breakdown.totalAnnual * drPct : 0, { compact: true })} accent="amber" />
-              <MiniMetric label="ROI" value={pct(result.roi.roiPercentage / 100, 0)} accent={result.roi.roiPercentage >= 0 ? "signal" : "coral"} sub={`payback ${years(result.roi.paybackPeriodYears)}`} />
-              <MiniMetric label="Gross savings" value={gbp(result.roi.grossAvoidedCost, { compact: true })} />
-              <MiniMetric label="Infrastructure" value={gbp(infraCost(result), { compact: true })} accent="amber" />
-              <MiniMetric label="Residual human" value={gbp(categoryCost(result, "HUMAN_ESCALATION"), { compact: true })} accent="violet" />
-              <MiniMetric label="Voice platform" value={gbp(categoryCost(result, "VOICE_SERVICE"), { compact: true })} />
-              <MiniMetric label="Off-hours → AI" value={`${offHoursPct}%`} accent="amber" sub={`${humanHours}h human / 24h AI`} />
-              <MiniMetric label="Cost / in call" value={gbp(result.costPerIncomingCall, { decimals: 3 })} />
-              <MiniMetric label="Cost / telephony min" value={gbp(result.costPerTelephonyMinute, { decimals: 3 })} />
-              <MiniMetric label="Cost / resolved" value={gbp(result.costPerResolvedCall, { decimals: 3 })} accent="signal" />
-              <MiniMetric label="Peak concurrency" value={num(result.volumes.peakConcurrentCalls)} accent="amber" />
-            </div>
-          </div>
-        </section>
-
-        {/* Concurrency profile */}
+        {showAdvanced && (
+          <>
+        {/* Capacity */}
         <section className="mt-8">
           <div className="rounded-2xl border hairline bg-panel p-5">
-            <SectionLabel n="CP" title="24-hour concurrency profile" />
-            <p className="mb-3 text-xs text-muted">
-              Profile is saved with the scenario. Drag bars to shape concurrency throughout the day.
-              The peak value feeds into all stepped infrastructure sizing.
-            </p>
+            <SectionLabel n="EC2" title="EC2 node sizing" />
             <ConcurrencyProfile
               profile={scenario.callProfile.concurrencyProfile}
               onChange={(p) => setCall({ concurrencyProfile: p })}
-              steppedComponents={components
-                .filter((c) => c.pricing.model === "STEPPED_INFRASTRUCTURE" && c.pricing.scaling && c.enabled)
-                .map((c) => ({
-                  id: c.id,
-                  label: c.service.length > 25 ? c.service.slice(0, 23) + "…" : c.service,
-                  capacityPerUnit: c.pricing.scaling!.capacityPerUnit,
-                  unitPrice: c.pricing.unitPrice,
-                }))}
-              onUpdateComponent={(id, cap) =>
-                updateComponent(id, {
-                  pricing: {
-                    ...components.find((c) => c.id === id)!.pricing,
-                    scaling: {
-                      ...components.find((c) => c.id === id)!.pricing.scaling!,
-                      capacityPerUnit: cap,
-                    },
-                  },
-                })
-              }
+              steppedComponents={components.filter((c) => c.id === "ec2-nitro-inference" && c.pricing.model === "STEPPED_INFRASTRUCTURE" && c.pricing.scaling && c.enabled).map((c) => ({ id: c.id, label: c.service.length > 25 ? c.service.slice(0, 23) + "..." : c.service, capacityPerUnit: c.pricing.scaling!.capacityPerUnit, unitPrice: c.pricing.unitPrice }))}
+              onUpdateComponent={(id, cap) => updateComponent(id, { pricing: { ...components.find((c) => c.id === id)!.pricing, scaling: { ...components.find((c) => c.id === id)!.pricing.scaling!, capacityPerUnit: cap } } })}
             />
           </div>
         </section>
+
+          </>
+        )}
 
         {/* Growth curves */}
         <section className="mt-8">
@@ -783,7 +633,7 @@ export default function Page() {
                 />
                 <Slider
                   label="Baseline cost inflation"
-                  description={`Human cost per contact inflates ${growth.inflationPct}% per year`}
+                  description={`Human cost per minute inflates ${growth.inflationPct}% per year`}
                   min={0} max={10} step={0.5}
                   value={growth.inflationPct}
                   onChange={(v) => setGrowth((g) => ({ ...g, inflationPct: v }))}
@@ -830,58 +680,8 @@ export default function Page() {
           </div>
         </section>
 
-        {/* Cost waterfall */}
-        <section className="mt-6">
-          <div className="rounded-2xl border hairline bg-panel p-5">
-            <div className="mb-4 flex items-center justify-between">
-              <SectionLabel n="03" title="Cost waterfall" inline />
-              <div className="flex gap-1 rounded-lg border hairline bg-panel2 p-0.5">
-                {(["total", "perCall"] as const).map((m) => (
-                  <button
-                    key={m}
-                    onClick={() => setWaterfallMode(m)}
-                    className={`rounded-md px-3 py-1 text-xs figure transition-colors ${
-                      waterfallMode === m ? "bg-signal text-ground" : "text-muted hover:text-ink"
-                    }`}
-                  >
-                    {m === "total" ? "£ total" : "£ / call"}
-                  </button>
-                ))}
-              </div>
-            </div>
-            <CostWaterfall
-              breakdown={result.breakdown}
-              annualCalls={result.volumes.annualIncomingCalls}
-              mode={waterfallMode}
-            />
-          </div>
-        </section>
-
-        {/* Fixed/variable + marginal */}
-        <section className="mt-10 grid grid-cols-1 gap-6 lg:grid-cols-2">
-          <div className="rounded-2xl border hairline bg-panel p-5">
-            <SectionLabel n="04" title="Fixed vs variable" />
-            <FixedVariableSplit breakdown={result.breakdown} />
-          </div>
-          <div className="rounded-2xl border hairline bg-panel p-5">
-            <SectionLabel n="05" title="Marginal cost" />
-            <p className="mb-4 text-xs text-muted">
-              Cost of the next calls, computed by re-running the model at higher volume — not by dividing
-              TCO by calls. Fixed and stepped infrastructure are excluded until a capacity step is crossed.
-            </p>
-            <div className="grid grid-cols-3 gap-3">
-              <MarginalTile label="Next 1 call" value={gbp(result.marginal.nextOneCall, { decimals: 4 })} />
-              <MarginalTile label="Next 1,000" value={gbp(result.marginal.nextThousandCalls, { compact: true })} />
-              <MarginalTile label="Next 1,000,000" value={gbp(result.marginal.nextMillionCalls, { compact: true })} />
-            </div>
-            <div className="mt-4 rounded-lg border hairline bg-panel2 p-3 text-xs text-muted">
-              Average cost / incoming call is{" "}
-              <span className="figure text-ink">{gbp(result.costPerIncomingCall, { decimals: 3 })}</span>. Marginal
-              sits below average because fixed costs are already absorbed.
-            </div>
-          </div>
-        </section>
-
+        {showAdvanced && (
+          <>
         {/* Driver overrides */}
         <section className="mt-10">
           <DriverOverrides
@@ -895,7 +695,7 @@ export default function Page() {
 
         {/* Scenario comparison */}
         <section className="mt-10">
-          <SectionLabel n="06" title="Scenario comparison" />
+          <SectionLabel n="05" title="Scenario comparison" />
           <p className="mb-4 max-w-3xl text-sm text-muted">
             All saved scenarios compared side-by-side using the same supplier and infrastructure. Click
             a row to load that scenario.
@@ -965,7 +765,7 @@ export default function Page() {
         {/* Full breakdown */}
         <section className="mt-10">
           <div className="mb-4 flex items-center justify-between">
-            <SectionLabel n="07" title="Cost breakdown & audit" inline />
+            <SectionLabel n="06" title="Cost breakdown & audit" inline />
             <div className="flex gap-2">
               <button
                 onClick={() => setShowAddForm((v) => !v)}
@@ -999,7 +799,7 @@ export default function Page() {
 
         {/* Cost flow diagram */}
         <section className="mt-10">
-          <SectionLabel n="08" title="Cost flow" />
+          <SectionLabel n="07" title="Cost flow" />
           <p className="mb-4 max-w-3xl text-sm text-muted">
             How cost flows from usage drivers through individual components into cost categories.
             Hover any node or link to highlight. Changes dynamically with every parameter.
@@ -1011,7 +811,7 @@ export default function Page() {
 
         {/* Network architecture diagram */}
         <section className="mt-10">
-          <SectionLabel n="09" title="Network architecture" />
+          <SectionLabel n="08" title="Network architecture" />
           <p className="mb-4 max-w-3xl text-sm text-muted">
             Infrastructure topology — how services connect and where cost sits. Dashed arrows show the
             call/data flow path. Hover any node to see its annual cost.
@@ -1020,6 +820,8 @@ export default function Page() {
             <NetworkDiagram breakdown={result.breakdown} />
           </div>
         </section>
+          </>
+        )}
 
         <SampleDataNotice />
           </>
@@ -1158,7 +960,7 @@ function HeroThesis({
   result: ReturnType<typeof computeScenarioResult>;
   scenario: Scenario;
 }) {
-  const benefit = result.roi.netBenefit;
+  const benefit = result.roi.grossAvoidedCost;
   const positive = benefit >= 0;
   return (
     <div className="relative overflow-hidden rounded-2xl border hairline bg-panel p-6 grid-noise">
@@ -1167,7 +969,7 @@ function HeroThesis({
         <span className={`figure text-figure-xl ${positive ? "text-signal" : "text-coral"}`}>
           {gbp(benefit, { compact: true })}
         </span>
-        <span className="text-sm text-muted">net benefit / yr</span>
+        <span className="text-sm text-muted">operating saving / yr</span>
       </div>
       <p className="mt-3 max-w-xl text-sm leading-relaxed text-muted">
         Handling{" "}
@@ -1197,6 +999,507 @@ function HeroStat({ label, value }: { label: string; value: string }) {
   );
 }
 
+function ExecutiveForecast({
+  scenario,
+  result,
+  components,
+  onUpdateComponent,
+  onScenarioChange,
+  onCallChange,
+}: {
+  scenario: Scenario;
+  result: ReturnType<typeof computeScenarioResult>;
+  components: CostComponent[];
+  onUpdateComponent: (id: string, patch: Partial<CostComponent>) => void;
+  onScenarioChange: React.Dispatch<React.SetStateAction<Scenario>>;
+  onCallChange: (patch: Partial<Scenario["callProfile"]>) => void;
+}) {
+  const humanCostPerContact =
+    scenario.baseline.baselineCostPerMinute * scenario.baseline.currentAverageHandleTimeMin;
+  const aiCostPerContact = result.costPerIncomingCall;
+  const savingPerContact = humanCostPerContact - aiCostPerContact;
+  const peakConcurrency = Math.round(result.volumes.peakConcurrentCalls);
+  const drCost = categoryLineCost(result, "dr-overhead");
+  const preprodCost = categoryLineCost(result, "preprod-overhead");
+  const stagingCost = categoryLineCost(result, "staging-overhead");
+  const residualHumanCost = categoryCost(result, "HUMAN_ESCALATION");
+  const evaluationCost = result.breakdown.byCategory.find(
+    (category) => category.category === "EVALUATION_AND_ASSURANCE"
+  )?.annualCost ?? 0;
+  const operatingModelCost = drCost + preprodCost + stagingCost + evaluationCost;
+  const voiceComponent = components.find(
+    (component) => component.category === "VOICE_SERVICE" && component.id === "voice-a-percall"
+  );
+  const humanEscalationComponent = components.find(
+    (component) => component.id === "human-escalation"
+  );
+  const ec2Component = components.find((component) => component.id === "ec2-nitro-inference");
+  const llmLineCost = categoryLineCost(result, "bedrock-llm-io");
+  const platformOpsComponent = components.find((component) => component.id === "platform-ops");
+  const sagemakerRealtimeComponent = components.find(
+    (component) => component.id === "sagemaker-realtime-inference"
+  );
+  const sagemakerRealtimeCost = categoryLineCost(result, "sagemaker-realtime-inference");
+  const voicePlatformCostPerAiMinute = voiceComponent?.pricing.unitPrice ?? 0;
+  const platformOpsAnnualCost = (platformOpsComponent?.pricing.unitPrice ?? 0) * 12;
+  const inputTokensPerAiCall =
+    scenario.aiUsage.avgInputTokensPerInteraction * scenario.aiUsage.llmCallsPerConversation;
+  const outputTokensPerAiCall =
+    scenario.aiUsage.avgOutputTokensPerInteraction * scenario.aiUsage.llmCallsPerConversation;
+  const reasoningTokensPerAiCall =
+    scenario.aiUsage.avgReasoningTokensPerInteraction * scenario.aiUsage.llmCallsPerConversation;
+  const costedTokensPerAiCall = inputTokensPerAiCall + outputTokensPerAiCall;
+  const totalTokensPerAiCall = costedTokensPerAiCall + reasoningTokensPerAiCall;
+  const annualCostedLlmTokens = costedTokensPerAiCall * result.volumes.aiCalls;
+  const ec2Nodes = requiredPeakUnits(ec2Component, peakConcurrency);
+  const sagemakerRealtimeUnits = requiredPeakUnits(sagemakerRealtimeComponent, peakConcurrency);
+  const abandoned = scenario.outcome.abandonedPercentage;
+  const failed = scenario.outcome.failedPercentage;
+
+  const setVolume = (annualIncomingCalls: number) => {
+    onScenarioChange((s) => ({
+      ...s,
+      callProfile: { ...s.callProfile, annualIncomingCalls },
+      baseline: { ...s.baseline, currentAnnualCallVolume: annualIncomingCalls },
+    }));
+  };
+
+  const setDuration = (averageCallDurationMin: number) => {
+    onScenarioChange((s) => ({
+      ...s,
+      callProfile: { ...s.callProfile, averageCallDurationMin },
+      baseline: {
+        ...s.baseline,
+        currentAverageHandleTimeMin: averageCallDurationMin,
+        simpleCurrentCostPerContact: s.baseline.baselineCostPerMinute * averageCallDurationMin,
+      },
+    }));
+  };
+
+  const setHumanCostPerMinute = (costPerMinute: number) => {
+    onScenarioChange((s) => ({
+      ...s,
+      baseline: {
+        ...s.baseline,
+        baselineCostPerMinute: costPerMinute,
+        simpleCurrentCostPerContact: costPerMinute * s.baseline.currentAverageHandleTimeMin,
+      },
+    }));
+    if (humanEscalationComponent) {
+      onUpdateComponent(humanEscalationComponent.id, {
+        pricing: {
+          ...humanEscalationComponent.pricing,
+          unitPrice: costPerMinute,
+        },
+      });
+    }
+  };
+
+  const setResolution = (resolutionRate: number) => {
+    onScenarioChange((s) => ({
+      ...s,
+      outcome: {
+        ...s.outcome,
+        resolutionRate,
+        escalationRate: Math.max(0, 1 - resolutionRate - abandoned - failed),
+      },
+    }));
+  };
+
+  const setPeakConcurrency = (targetPeak: number) => {
+    onCallChange({
+      concurrencyProfile: scaleConcurrencyProfile(
+        scenario.callProfile.concurrencyProfile,
+        targetPeak
+      ),
+    });
+  };
+
+  const setVoicePlatformCost = (unitPrice: number) => {
+    if (!voiceComponent) return;
+    onUpdateComponent(voiceComponent.id, {
+      pricing: {
+        ...voiceComponent.pricing,
+        unitPrice,
+      },
+    });
+  };
+
+  const setPlatformOpsAnnualCost = (annualCost: number) => {
+    if (!platformOpsComponent) return;
+    onUpdateComponent(platformOpsComponent.id, {
+      pricing: {
+        ...platformOpsComponent.pricing,
+        unitPrice: annualCost / 12,
+      },
+    });
+  };
+
+  const setSagemakerRealtimeEnabled = (enabled: boolean) => {
+    if (!sagemakerRealtimeComponent) return;
+    onUpdateComponent(sagemakerRealtimeComponent.id, { enabled });
+  };
+
+  const setAiUsage = (patch: Partial<Scenario["aiUsage"]>) => {
+    onScenarioChange((s) => ({
+      ...s,
+      aiUsage: {
+        ...s.aiUsage,
+        ...patch,
+      },
+    }));
+  };
+
+  const applyOverheadPreset = (
+    drOverheadPct: number,
+    preprodOverheadPct: number,
+    stagingOverheadPct: number,
+    autoEvaluatedPercentage?: number
+  ) => {
+    onScenarioChange((s) => ({
+      ...s,
+      drOverheadPct,
+      preprodOverheadPct,
+      stagingOverheadPct,
+      evaluation: {
+        ...s.evaluation,
+        autoEvaluatedPercentage: autoEvaluatedPercentage ?? s.evaluation.autoEvaluatedPercentage,
+      },
+    }));
+  };
+
+  return (
+    <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1.05fr_0.95fr]">
+      <div className="rounded-2xl border hairline bg-panel p-5">
+        <SectionLabel n="01" title="Executive forecast" />
+        <div className="mb-5 grid grid-cols-1 gap-3">
+          <Slider
+            label="Voice AI platform cost"
+            description="Commercial voice platform fee per AI-handled minute."
+            min={0}
+            max={0.25}
+            step={0.005}
+            value={voicePlatformCostPerAiMinute}
+            onChange={setVoicePlatformCost}
+            format={(v) => `${gbp(v, { decimals: 3 })}/AI min`}
+          />
+          <Slider
+            label="Platform run team cost"
+            description="Annual internal run-team, programme and operational overhead."
+            min={0}
+            max={5_000_000}
+            step={50_000}
+            value={platformOpsAnnualCost}
+            onChange={setPlatformOpsAnnualCost}
+            format={(v) => `${gbp(v, { compact: true })}/yr`}
+          />
+          <div>
+            <div className="mb-1.5 flex items-center justify-between gap-3">
+              <span className="block text-xs text-muted">Operating model preset</span>
+              <span className="figure text-[10px] text-amber">
+                adds {gbp(operatingModelCost, { compact: true })}/yr
+              </span>
+            </div>
+            <div className="grid grid-cols-3 gap-2">
+              {OPERATING_MODEL_PRESETS.map((preset) => (
+                <PresetButton
+                  key={preset.label}
+                  label={preset.label}
+                  detail={`DR ${preset.dr}% · pre-prod ${preset.preprod}% · staging ${preset.staging}% · eval ${pct(preset.evaluation)}`}
+                  active={
+                    (scenario.drOverheadPct ?? 0) === preset.dr &&
+                    (scenario.preprodOverheadPct ?? 0) === preset.preprod &&
+                    (scenario.stagingOverheadPct ?? 0) === preset.staging &&
+                    scenario.evaluation.autoEvaluatedPercentage === preset.evaluation
+                  }
+                  onClick={() =>
+                    applyOverheadPreset(
+                      preset.dr,
+                      preset.preprod,
+                      preset.staging,
+                      preset.evaluation
+                    )
+                  }
+                />
+              ))}
+            </div>
+            <div className="mt-2 grid grid-cols-2 gap-2 text-[10px] text-faint">
+              <span>DR: {scenario.drOverheadPct ?? 0}% = {gbp(drCost, { compact: true })}/yr</span>
+              <span>Pre-prod: {scenario.preprodOverheadPct ?? 0}% = {gbp(preprodCost, { compact: true })}/yr</span>
+              <span>Staging: {scenario.stagingOverheadPct ?? 0}% = {gbp(stagingCost, { compact: true })}/yr</span>
+              <span>Evaluation: {pct(scenario.evaluation.autoEvaluatedPercentage)} = {gbp(evaluationCost, { compact: true })}/yr</span>
+            </div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
+          <Slider
+            label="Annual incoming calls"
+            description="Primary demand forecast across the service."
+            min={1_000_000}
+            max={200_000_000}
+            step={1_000_000}
+            value={scenario.callProfile.annualIncomingCalls}
+            onChange={setVolume}
+            format={(v) => num(v)}
+          />
+          <Slider
+            label="Average call duration"
+            description="Used for AI, telephony, storage and human baseline minutes."
+            min={1}
+            max={20}
+            step={0.5}
+            value={scenario.callProfile.averageCallDurationMin}
+            onChange={setDuration}
+            format={(v) => `${v} min`}
+          />
+          <Slider
+            label="AI adoption"
+            description="Share of calls offered to the voice agent first."
+            min={0}
+            max={1}
+            step={0.01}
+            value={scenario.outcome.aiAdoptionPercentage}
+            onChange={(v) =>
+              onScenarioChange((s) => ({ ...s, outcome: { ...s.outcome, aiAdoptionPercentage: v } }))
+            }
+            format={(v) => pct(v)}
+          />
+          <Slider
+            label="AI resolution"
+            description="Share of AI calls completed without a human handoff."
+            min={0}
+            max={1}
+            step={0.01}
+            value={scenario.outcome.resolutionRate}
+            onChange={setResolution}
+            format={(v) => pct(v)}
+          />
+          <Slider
+            label="Human cost per minute"
+            description="Fully loaded agent handling cost per minute. Human cost/contact is derived from duration."
+            min={0.01}
+            max={2}
+            step={0.01}
+            value={scenario.baseline.baselineCostPerMinute}
+            onChange={setHumanCostPerMinute}
+            format={(v) => `${gbp(v, { decimals: 2 })}/min`}
+          />
+          <Slider
+            label="Peak concurrent calls"
+            description="Capacity driver for real-time voice infrastructure."
+            min={100}
+            max={100_000}
+            step={100}
+            value={peakConcurrency}
+            onChange={setPeakConcurrency}
+            format={(v) => num(v)}
+          />
+          <div className="rounded-lg border hairline bg-panel2 p-3 md:col-span-2">
+            <div className="mb-4">
+              <h3 className="text-xs font-semibold tracking-tight text-ink">LLM Token Costs</h3>
+              <p className="mt-1 text-[10px] leading-relaxed text-ink/90">
+                Controls how many model calls happen per phone call and how many input/output tokens each model call uses.
+              </p>
+            </div>
+            <div className="grid grid-cols-1 gap-5 md:grid-cols-3">
+              <Slider
+                label="LLM turns per call"
+                description="How many times the AI voice agent calls the language model during one phone call."
+                min={1}
+                max={15}
+                step={1}
+                value={scenario.aiUsage.llmCallsPerConversation}
+                onChange={(v) => setAiUsage({ llmCallsPerConversation: v })}
+                format={(v) => num(v)}
+              />
+              <Slider
+                label="Input tokens per turn"
+                description="Prompt, history, retrieval context and tool context per LLM call."
+                min={250}
+                max={12_000}
+                step={250}
+                value={scenario.aiUsage.avgInputTokensPerInteraction}
+                onChange={(v) => setAiUsage({ avgInputTokensPerInteraction: v })}
+                format={(v) => num(v)}
+              />
+              <Slider
+                label="Output tokens per turn"
+                description="Average assistant response tokens per LLM call."
+                min={50}
+                max={2_000}
+                step={50}
+                value={scenario.aiUsage.avgOutputTokensPerInteraction}
+                onChange={(v) => setAiUsage({ avgOutputTokensPerInteraction: v })}
+                format={(v) => num(v)}
+              />
+            </div>
+          </div>
+          <div className="rounded-lg border hairline bg-panel2 p-3">
+            <div className="mb-1.5 flex items-start justify-between gap-3">
+              <div>
+                <div className="text-xs text-muted">SageMaker real-time inference</div>
+                <p className="mt-1 text-[10px] leading-relaxed text-ink/90">
+                  Optional AWS calculator line. Enable only if Gov Voice uses SageMaker endpoints as a
+                  real-time inference tier in addition to EC2/Nitro.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSagemakerRealtimeEnabled(!sagemakerRealtimeComponent?.enabled)}
+                className={`figure rounded-full border px-3 py-1 text-[10px] ${
+                  sagemakerRealtimeComponent?.enabled
+                    ? "border-signalDim bg-signal/10 text-signal"
+                    : "hairline bg-panel text-faint"
+                }`}
+              >
+                {sagemakerRealtimeComponent?.enabled ? "Included" : "Excluded"}
+              </button>
+            </div>
+            <div className="grid grid-cols-2 gap-2 text-[10px] text-faint">
+              <span>Peak units: {num(sagemakerRealtimeUnits)}</span>
+              <span>Annual cost: {gbp(sagemakerRealtimeCost, { compact: true })}</span>
+            </div>
+          </div>
+          <Slider
+            label="Evaluation sampling"
+            description="Calls automatically quality-checked by AI evaluation."
+            min={0}
+            max={1}
+            step={0.01}
+            value={scenario.evaluation.autoEvaluatedPercentage}
+            onChange={(v) =>
+              onScenarioChange((s) => ({ ...s, evaluation: { ...s.evaluation, autoEvaluatedPercentage: v } }))
+            }
+            format={(v) => pct(v, v < 0.1 ? 1 : 0)}
+          />
+          <Slider
+            label="Year 1 ramp"
+            description="Lower effective variable usage during rollout."
+            min={0}
+            max={12}
+            step={1}
+            value={scenario.callProfile.yearOneRampMonths ?? 0}
+            onChange={(v) => onCallChange({ yearOneRampMonths: v })}
+            format={(v) => (v === 0 ? "instant" : `${v} months`)}
+          />
+        </div>
+      </div>
+
+      <div className="space-y-6">
+        <div className="rounded-2xl border hairline bg-panel p-5">
+          <SectionLabel n="02" title="Forecast output" />
+	          <div className="mb-3 grid grid-cols-1 gap-2">
+	            <MiniMetric label="Human baseline / year" value={gbp(result.roi.baselineAnnualCost, { compact: true })} />
+	            <MiniMetric label="AI + infra TCO / year" value={gbp(result.breakdown.totalAnnual, { compact: true })} accent="coral" />
+	            <MiniMetric label="Operating saving / year" value={gbp(result.roi.grossAvoidedCost, { compact: true })} accent={result.roi.grossAvoidedCost >= 0 ? "signal" : "coral"} />
+	          </div>
+	          <div className="mb-3 rounded-lg border hairline bg-panel2 p-3">
+	            <div className="mb-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-ink/90">
+	              Human baseline run-rate
+	            </div>
+	            <div className="grid grid-cols-3 gap-2">
+	              <MiniMetric label="Daily" value={gbp(result.roi.baselineAnnualCost / 365, { compact: true })} accent="coral" />
+	              <MiniMetric label="Monthly" value={gbp(result.roi.baselineAnnualCost / 12, { compact: true })} accent="coral" />
+	              <MiniMetric label="Annual" value={gbp(result.roi.baselineAnnualCost, { compact: true })} accent="coral" />
+	            </div>
+	          </div>
+	          <div className="grid grid-cols-2 gap-2">
+            <MiniMetric label="Human cost/contact" value={gbp(humanCostPerContact, { decimals: 2 })} />
+            <MiniMetric label="AI cost/contact" value={gbp(aiCostPerContact, { decimals: 3 })} />
+            <MiniMetric label="Saving/contact" value={gbp(savingPerContact, { decimals: 3 })} accent={savingPerContact >= 0 ? "signal" : "coral"} />
+            <MiniMetric label="ROI" value={pct(result.roi.roiPercentage / 100, 0)} accent={result.roi.roiPercentage >= 0 ? "signal" : "coral"} sub={`payback ${years(result.roi.paybackPeriodYears)}`} />
+            <MiniMetric label="AI resolved calls" value={num(result.volumes.resolvedCalls)} accent="signal" />
+            <MiniMetric label="Residual human calls" value={num(result.volumes.residualHumanCalls)} accent="amber" />
+            <MiniMetric label="Residual human cost" value={gbp(residualHumanCost, { compact: true })} accent="amber" />
+            <MiniMetric label="Peak concurrency" value={num(peakConcurrency)} accent="amber" />
+            <MiniMetric label="EC2 nodes required" value={num(ec2Nodes)} accent="amber" />
+            <MiniMetric label="LLM tokens / AI call" value={num(totalTokensPerAiCall)} sub={`${num(costedTokensPerAiCall)} billed in/out`} />
+            <MiniMetric label="Annual LLM tokens" value={num(annualCostedLlmTokens)} />
+            <MiniMetric label="LLM cost / year" value={gbp(llmLineCost, { compact: true })} />
+            <MiniMetric label="Run team / year" value={gbp(platformOpsAnnualCost, { compact: true })} />
+            {sagemakerRealtimeComponent?.enabled && (
+              <MiniMetric label="SageMaker / year" value={gbp(sagemakerRealtimeCost, { compact: true })} accent="violet" sub={`${num(sagemakerRealtimeUnits)} peak units`} />
+            )}
+          </div>
+        </div>
+
+	        <AssumptionSummary scenario={scenario} result={result} />
+	      </div>
+    </div>
+  );
+}
+
+function PresetButton({
+  label,
+  detail,
+  active,
+  onClick,
+}: {
+  label: string;
+  detail: string;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`rounded-lg border px-2 py-2 text-left transition-colors ${
+        active
+          ? "border-signalDim bg-signal/10 text-ink"
+          : "hairline bg-panel2 text-muted hover:border-signalDim hover:text-ink"
+      }`}
+    >
+      <span className="figure block text-xs">{label}</span>
+      <span className="mt-1 block text-[10px] leading-snug text-faint">{detail}</span>
+    </button>
+  );
+}
+
+function AssumptionSummary({
+  scenario,
+  result,
+}: {
+  scenario: Scenario;
+  result: ReturnType<typeof computeScenarioResult>;
+}) {
+  const inputTokensPerAiCall =
+    scenario.aiUsage.avgInputTokensPerInteraction * scenario.aiUsage.llmCallsPerConversation;
+  const outputTokensPerAiCall =
+    scenario.aiUsage.avgOutputTokensPerInteraction * scenario.aiUsage.llmCallsPerConversation;
+  const reasoningTokensPerAiCall =
+    scenario.aiUsage.avgReasoningTokensPerInteraction * scenario.aiUsage.llmCallsPerConversation;
+  const totalTokensPerAiCall = inputTokensPerAiCall + outputTokensPerAiCall + reasoningTokensPerAiCall;
+  const annualLlmCost = categoryLineCost(result, "bedrock-llm-io");
+  const sagemakerRealtimeCost = categoryLineCost(result, "sagemaker-realtime-inference");
+  const items = [
+    ["AI outcome", `${pct(scenario.outcome.aiAdoptionPercentage)} adoption, ${pct(scenario.outcome.resolutionRate)} resolution, ${pct(scenario.outcome.escalationRate)} escalation`],
+    ["Human baseline", `${gbp(scenario.baseline.baselineCostPerMinute, { decimals: 2 })}/min, ${gbp(scenario.baseline.simpleCurrentCostPerContact, { decimals: 2 })}/contact derived`],
+    ["Voice usage", `${num(result.volumes.aiCalls)} AI calls, ${gbp(result.costPerAiMinute, { decimals: 3 })}/AI min`],
+    ["LLM usage", `${num(scenario.aiUsage.llmCallsPerConversation)} turns/call, ${num(totalTokensPerAiCall)} tokens/AI call, ${gbp(annualLlmCost, { compact: true })}/yr`],
+    ["Overheads", `${scenario.drOverheadPct ?? 0}% DR, ${scenario.preprodOverheadPct ?? 0}% pre-prod, ${scenario.stagingOverheadPct ?? 0}% staging`],
+    ["Assurance", `${pct(scenario.evaluation.autoEvaluatedPercentage)} evaluated, ${scenario.storage.audioRetentionDays}d audio retention`],
+  ];
+  if (sagemakerRealtimeCost > 0) {
+    items.push(["SageMaker real-time", `${gbp(sagemakerRealtimeCost, { compact: true })}/yr included as optional endpoint capacity`]);
+  }
+
+  return (
+    <div className="rounded-2xl border hairline bg-panel p-5">
+      <SectionLabel n="04" title="Assumptions included" />
+      <div className="space-y-2">
+        {items.map(([label, value]) => (
+          <div key={label} className="flex items-start justify-between gap-4 border-b hairline pb-2 last:border-0 last:pb-0">
+            <span className="text-xs text-faint">{label}</span>
+            <span className="max-w-[70%] text-right text-xs text-muted">{value}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function MiniMetric({
   label,
   value,
@@ -1218,15 +1521,6 @@ function MiniMetric({
       <div className="text-[10px] text-faint">{label}</div>
       <div className={`figure text-sm ${color}`}>{value}</div>
       {sub && <div className="text-[10px] text-faint">{sub}</div>}
-    </div>
-  );
-}
-
-function MarginalTile({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-xl border hairline bg-panel2 px-3 py-3">
-      <div className="eyebrow mb-2">{label}</div>
-      <div className="figure text-base text-signal">{value}</div>
     </div>
   );
 }
@@ -1262,7 +1556,8 @@ function exportCSV(scenario: any, result: any, projection: any[], portfolio: any
     ["Annual calls", String(scenario.callProfile.annualIncomingCalls)],
     ["Avg call duration", `${scenario.callProfile.averageCallDurationMin} min`],
     ["AI resolution", `${(scenario.outcome.resolutionRate * 100).toFixed(0)}%`],
-    ["Baseline cost/call", `£${scenario.baseline.simpleCurrentCostPerContact.toFixed(2)}`],
+    ["Human cost/min", `£${scenario.baseline.baselineCostPerMinute.toFixed(2)}`],
+    ["Derived baseline cost/call", `£${scenario.baseline.simpleCurrentCostPerContact.toFixed(2)}`],
     ["DR overhead", `${scenario.drOverheadPct ?? 0}%`],
     ["Year 1 ramp", `${scenario.callProfile.yearOneRampMonths ?? 0} months`],
     ["Investment", `£${scenario.investment.toLocaleString()}`],
@@ -1314,20 +1609,29 @@ function SampleDataNotice() {
 
 /* ------------------------------------------------------------------ helpers */
 
+function scaleConcurrencyProfile(profile: number[] | undefined, targetPeak: number): number[] {
+  const base =
+    profile && profile.length === 24
+      ? profile
+      : [500, 300, 200, 150, 150, 200, 500, 1000, 4000, 8000, 10000, 12000, 12000, 11000, 10000, 9000, 8000, 6000, 4000, 2000, 1500, 1200, 1000, 800];
+  const currentPeak = Math.max(...base, 1);
+  const factor = Math.max(1, targetPeak) / currentPeak;
+  return base.map((v) => Math.round(v * factor));
+}
+
+function requiredPeakUnits(component: CostComponent | undefined, peakConcurrency: number): number {
+  const scaling = component?.pricing.scaling;
+  if (!component?.enabled || !scaling) return 0;
+  const capacityPerUnit = Math.max(1e-9, scaling.capacityPerUnit);
+  const calculatedUnits = scaling.manualUnits ?? Math.ceil(peakConcurrency / capacityPerUnit);
+  const unitsWithMinimum = Math.max(scaling.minUnits, calculatedUnits);
+  return scaling.maxUnits == null ? unitsWithMinimum : Math.min(scaling.maxUnits, unitsWithMinimum);
+}
+
 function categoryCost(r: ReturnType<typeof computeScenarioResult>, cat: string): number {
   return r.breakdown.byCategory.find((c) => c.category === cat)?.annualCost ?? 0;
 }
 
-function infraCost(r: ReturnType<typeof computeScenarioResult>): number {
-  const infraCats = [
-    "TELEPHONY_AND_INTEGRATION",
-    "AI_AND_COMPUTE",
-    "KNOWLEDGE",
-    "AUDIO_TRANSCRIPT_STORAGE",
-    "OPERATIONS_AND_OBSERVABILITY",
-    "DATA_AND_ANALYTICS",
-  ];
-  return r.breakdown.byCategory
-    .filter((c) => infraCats.includes(c.category))
-    .reduce((s, c) => s + c.annualCost, 0);
+function categoryLineCost(r: ReturnType<typeof computeScenarioResult>, componentId: string): number {
+  return r.breakdown.lines.find((line) => line.componentId === componentId)?.annualCost ?? 0;
 }

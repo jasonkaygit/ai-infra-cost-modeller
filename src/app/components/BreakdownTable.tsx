@@ -8,7 +8,6 @@ import type {
   CostCategory,
   UsageDriver,
   FixedVariableClass,
-  Environment,
   Frequency,
 } from "../../domain/types";
 import { COST_CATEGORY_LABELS, WATERFALL_ORDER } from "../../domain/types";
@@ -53,7 +52,6 @@ const DRIVERS: UsageDriver[] = [
 ];
 
 const CLASSIFICATIONS: FixedVariableClass[] = ["VARIABLE", "SEMI_VARIABLE", "STEPPED", "FIXED", "ONE_OFF"];
-const ENVIRONMENTS: Environment[] = ["PROD", "NON_PROD", "SHARED"];
 const FREQUENCIES: Frequency[] = ["MONTHLY", "ANNUAL", "ONE_OFF"];
 
 export function BreakdownTable({
@@ -412,12 +410,6 @@ function ComponentEditor({
                 value={component.classification}
                 onChange={(v) => update({ classification: v as FixedVariableClass })}
                 options={CLASSIFICATIONS.map((c) => ({ value: c, label: c.replace("_", "-") }))}
-              />
-              <InlineSelect
-                label="Environment"
-                value={component.environment}
-                onChange={(v) => update({ environment: v as Environment })}
-                options={ENVIRONMENTS.map((e) => ({ value: e, label: e.replace("_", " ") }))}
               />
               <InlineSelect
                 label="Frequency"
