@@ -10,7 +10,6 @@ import { Slider } from "./components/Control";
 import { DriverOverrides } from "./components/DriverOverrides";
 import { AddComponentForm } from "./components/AddComponentForm";
 import { ScenarioManager } from "./components/ScenarioManager";
-import { CostFlowDiagram } from "./components/CostFlowDiagram";
 import { NetworkDiagram } from "./components/NetworkDiagram";
 import { ConcurrencyProfile } from "./components/ConcurrencyProfile";
 import { CustomerManager } from "./components/CustomerManager";
@@ -31,6 +30,68 @@ const OPERATING_MODEL_PRESETS = [
   { label: "Standard", dr: 35, preprod: 15, staging: 15, evaluation: 0.1 },
   { label: "Gov-ready", dr: 60, preprod: 20, staging: 20, evaluation: 0.25 },
 ] as const;
+
+type ProjectionSettings = {
+  startYear: number;
+  volumePct: number;
+  inflationPct: number;
+  supplierPricePct: number;
+  infrastructurePricePct: number;
+  aiPricePct: number;
+  years: number;
+  concurrencyFollowsVolume: boolean;
+};
+
+type ForecastCategoryKey =
+  | "voiceSupplier"
+  | "telephony"
+  | "aiLlm"
+  | "infrastructure"
+  | "storage"
+  | "evaluation"
+  | "operations";
+
+type ForecastProjectionRow = {
+  year: number;
+  fiscalYear: number;
+  label: string;
+  volume: number;
+  peakConcurrency: number;
+  baselineAnnualCost: number;
+  totalCost: number;
+  costPerCall: number;
+  yoyChangePct: number;
+  categories: Record<ForecastCategoryKey, number>;
+};
+
+const DEFAULT_PROJECTION: ProjectionSettings = {
+  startYear: 2027,
+  volumePct: 10,
+  inflationPct: 3,
+  supplierPricePct: 0,
+  infrastructurePricePct: 2,
+  aiPricePct: -5,
+  years: 5,
+  concurrencyFollowsVolume: true,
+};
+
+const FORECAST_COST_ROWS = [
+  { key: "callVolume", label: "Call volume", kind: "number" },
+  { key: "voiceSupplier", label: "Voice supplier", kind: "money" },
+  { key: "telephony", label: "Telephony", kind: "money" },
+  { key: "aiLlm", label: "AI / LLM", kind: "money" },
+  { key: "infrastructure", label: "Infrastructure", kind: "money" },
+  { key: "storage", label: "Storage", kind: "money" },
+  { key: "evaluation", label: "Evaluation", kind: "money" },
+  { key: "operations", label: "Operations", kind: "money" },
+  { key: "totalCost", label: "Total cost", kind: "money" },
+  { key: "yoyChangePct", label: "YoY cost change", kind: "percent" },
+  { key: "costPerCall", label: "Cost per call", kind: "unitMoney" },
+] as const;
+
+function ensureProjectionSettings(value: Partial<ProjectionSettings> | null): ProjectionSettings {
+  return { ...DEFAULT_PROJECTION, ...(value ?? {}) };
+}
 
 // Persistence: localStorage (fast sync cache) + SQLite (primary, durable)
 // Background: on every write, localStorage is updated immediately for fast reload,
@@ -85,7 +146,7 @@ export default function Page() {
   });
   const [showBreakdown, setShowBreakdown] = useState(true);
   const [showAddForm, setShowAddForm] = useState(false);
-  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(true);
   const [activeTab, setActiveTab] = useState<"overview" | "customers" | "portfolio">("overview");
   const [hasHydrated, setHasHydrated] = useState(false);
 
@@ -107,11 +168,19 @@ export default function Page() {
     }).catch(() => {});
   }, []);
 
-  // Growth rates for multi-year projection
+  // FinOps projection assumptions.
   const [growth, setGrowth] = useState(() =>
-    loadJSON("voice-ai:growth", { volumePct: 15, resolutionPts: 3, inflationPct: 3, years: 3 })
+    ensureProjectionSettings(loadJSON<Partial<ProjectionSettings> | null>("voice-ai:growth", null))
   );
   useEffect(() => { saveJSON("voice-ai:growth", growth); }, [growth]);
+  const [forecastCallOverrides, setForecastCallOverrides] = useState<Record<number, number>>(() =>
+    loadJSON<Record<number, number>>("voice-ai:forecastCallOverrides", {})
+  );
+  const [componentForecastRates, setComponentForecastRates] = useState<Record<string, number>>(() =>
+    loadJSON<Record<string, number>>("voice-ai:componentForecastRates", {})
+  );
+  useEffect(() => { saveJSON("voice-ai:forecastCallOverrides", forecastCallOverrides); }, [forecastCallOverrides]);
+  useEffect(() => { saveJSON("voice-ai:componentForecastRates", componentForecastRates); }, [componentForecastRates]);
 
   // Auto-set default concurrency profile if none is set on the active scenario
   useEffect(() => {
@@ -317,70 +386,210 @@ export default function Page() {
   const combinedDR = portfolio.reduce((s, p) => s + p.drCost, 0);
   const combinedCalls = portfolio.reduce((s, p) => s + p.result.volumes.annualIncomingCalls, 0);
 
-  // Multi-year portfolio projections: compute full engine run per customer per year
+  // Multi-year portfolio projections use the same forecast assumptions as the
+  // executive model, then rerun the cost engine for each customer/year.
   const portfolioProjections = useMemo(() => {
     const years = growth.years;
-    const result: { year: number; customers: { customer: Customer; volume: number; resolution: number; baselineCost: number; tco: number; drCost: number; }[]; totalTCO: number; totalDR: number; totalBenefit: number; }[] = [];
+    const result: {
+      year: number;
+      fiscalYear: number;
+      label: string;
+      customers: {
+        customer: Customer;
+        volume: number;
+        resolution: number;
+        baselineCost: number;
+        tco: number;
+        drCost: number;
+        peakConcurrency: number;
+      }[];
+      totalTCO: number;
+      totalDR: number;
+      totalBenefit: number;
+      totalPeakConcurrency: number;
+    }[] = [];
     for (let y = 1; y <= years; y++) {
-      let factor = 1; let resPts = 0;
-      for (let yy = 2; yy <= y; yy++) { factor *= 1 + growth.volumePct / 100; resPts += growth.resolutionPts / 100; }
-      const inflation = Math.pow(1 + growth.inflationPct / 100, y - 1);
-      const activeDrPct = scenario.drOverheadPct ?? 0;
+      const yearIndex = y - 1;
+      const fiscalYear = growth.startYear + yearIndex;
+      const volumeFactor = projectionFactor(growth.volumePct, yearIndex);
+      const humanCostFactor = projectionFactor(growth.inflationPct, yearIndex);
       const activeProf = scenario.callProfile.concurrencyProfile;
+      const projectedComponents = applyProjectionPriceChanges(
+        components,
+        growth,
+        componentForecastRates,
+        yearIndex,
+        y === 1
+      );
       const customers = portfolio.map(({ customer, scenario: custScenario }) => {
-        const vol = Math.round(custScenario.callProfile.annualIncomingCalls * factor);
-        const res = Math.min(1, custScenario.outcome.resolutionRate + resPts);
-        const bl = custScenario.baseline.simpleCurrentCostPerContact * inflation;
-        const cp = customer.concurrencyProfile ?? custScenario.callProfile.concurrencyProfile ?? activeProf;
+        const vol = Math.round(custScenario.callProfile.annualIncomingCalls * volumeFactor);
+        const res = custScenario.outcome.resolutionRate;
+        const projectedCostPerMinute = custScenario.baseline.baselineCostPerMinute * humanCostFactor;
+        const projectedAht = custScenario.baseline.currentAverageHandleTimeMin;
+        const baseProfile = customer.concurrencyProfile ?? custScenario.callProfile.concurrencyProfile ?? activeProf;
+        const cp =
+          growth.concurrencyFollowsVolume && baseProfile
+            ? scaleConcurrencyProfileByFactor(baseProfile, volumeFactor)
+            : baseProfile;
         const scen: Scenario = {
           ...custScenario,
           callProfile: { ...custScenario.callProfile, annualIncomingCalls: vol, concurrencyProfile: cp },
           outcome: { ...custScenario.outcome, resolutionRate: res },
-          baseline: { ...custScenario.baseline, simpleCurrentCostPerContact: bl, currentAnnualCallVolume: vol },
+          baseline: {
+            ...custScenario.baseline,
+            baselineCostPerMinute: projectedCostPerMinute,
+            simpleCurrentCostPerContact: projectedCostPerMinute * projectedAht,
+            currentAnnualCallVolume: vol,
+          },
         };
-        const r = computeScenarioResult(scen, supplier, componentsWithoutDR, driverOverrides);
-        const preDR = r.breakdown.totalAnnual;
-        const dr = (activeDrPct / 100) * preDR;
-        return { customer, volume: vol, resolution: res, baselineCost: bl, tco: preDR + dr, drCost: dr };
+        const projectedComponentsWithoutOverhead = projectedComponents.map((c) =>
+          overheadIds.includes(c.id) ? { ...c, pricing: { ...c.pricing, unitPrice: 0 } } : c
+        );
+        const preOverhead = computeScenarioResult(scen, supplier, projectedComponentsWithoutOverhead, driverOverrides);
+        const projectedComponentsWithOverhead = projectedComponents.map((c) => {
+          const base = preOverhead.breakdown.totalAnnual;
+          if (c.id === "dr-overhead" && (scen.drOverheadPct ?? 0) > 0) {
+            return { ...c, pricing: { ...c.pricing, unitPrice: (base * ((scen.drOverheadPct ?? 0) / 100)) / 12 } };
+          }
+          if (c.id === "preprod-overhead" && (scen.preprodOverheadPct ?? 0) > 0) {
+            return { ...c, pricing: { ...c.pricing, unitPrice: (base * ((scen.preprodOverheadPct ?? 0) / 100)) / 12 } };
+          }
+          if (c.id === "staging-overhead" && (scen.stagingOverheadPct ?? 0) > 0) {
+            return { ...c, pricing: { ...c.pricing, unitPrice: (base * ((scen.stagingOverheadPct ?? 0) / 100)) / 12 } };
+          }
+          return c;
+        });
+        const r = computeScenarioResult(scen, supplier, projectedComponentsWithOverhead, driverOverrides);
+        const dr = categoryLineCost(r, "dr-overhead");
+        const tco = r.breakdown.totalAnnual + (y === 1 ? scen.investment : 0);
+        return {
+          customer,
+          volume: vol,
+          resolution: res,
+          baselineCost: projectedCostPerMinute * projectedAht,
+          tco,
+          drCost: dr,
+          peakConcurrency: Math.round(r.volumes.peakConcurrentCalls),
+        };
       });
       result.push({
         year: y,
+        fiscalYear,
+        label: fiscalYearLabel(fiscalYear),
         customers,
         totalTCO: customers.reduce((s, c) => s + c.tco, 0),
         totalDR: customers.reduce((s, c) => s + c.drCost, 0),
         totalBenefit: customers.reduce((s, c) => s + c.baselineCost * c.volume - c.tco, 0),
+        totalPeakConcurrency: customers.reduce((s, c) => s + c.peakConcurrency, 0),
       });
     }
     return result;
-  }, [portfolio, growth, supplier, componentsWithoutDR, driverOverrides]);
+  }, [portfolio, growth, supplier, components, componentForecastRates, overheadIds, driverOverrides, scenario.callProfile.concurrencyProfile]);
 
-  // Multi-year projection
+  // Multi-year FinOps projection: recalculate the full model every year from
+  // projected demand, concurrency, outcomes and category-specific price changes.
   const projection = useMemo(() => {
-    const rows = [];
-    let vol = scenario.callProfile.annualIncomingCalls;
-    let res = scenario.outcome.resolutionRate;
-    let bl = scenario.baseline.simpleCurrentCostPerContact;
-    let cumNet = 0;
+    const rows: ForecastProjectionRow[] = [];
     for (let y = 1; y <= growth.years; y++) {
+      const yearIndex = y - 1;
+      const fiscalYear = growth.startYear + yearIndex;
+      const volumeFactor = projectionFactor(growth.volumePct, yearIndex);
+      const automaticVolume = Math.round(scenario.callProfile.annualIncomingCalls * volumeFactor);
+      const projectedVolume = forecastCallOverrides[fiscalYear] ?? automaticVolume;
+      const effectiveVolumeFactor =
+        scenario.callProfile.annualIncomingCalls > 0
+          ? projectedVolume / scenario.callProfile.annualIncomingCalls
+          : 1;
+      const humanCostFactor = projectionFactor(growth.inflationPct, yearIndex);
+      const projectedCostPerMinute = scenario.baseline.baselineCostPerMinute * humanCostFactor;
+      const projectedAht = scenario.baseline.currentAverageHandleTimeMin;
+      const projectedProfile =
+        growth.concurrencyFollowsVolume && scenario.callProfile.concurrencyProfile
+          ? scaleConcurrencyProfileByFactor(scenario.callProfile.concurrencyProfile, effectiveVolumeFactor)
+          : scenario.callProfile.concurrencyProfile;
       const scen: Scenario = {
         ...scenario,
-        callProfile: { ...scenario.callProfile, annualIncomingCalls: Math.round(vol) },
-          outcome: { ...scenario.outcome, resolutionRate: Math.min(1, res) },
-        baseline: { ...scenario.baseline, simpleCurrentCostPerContact: bl, currentAnnualCallVolume: Math.round(vol) },
+        callProfile: {
+          ...scenario.callProfile,
+          annualIncomingCalls: projectedVolume,
+          concurrencyProfile: projectedProfile,
+        },
+        outcome: {
+          ...scenario.outcome,
+        },
+        baseline: {
+          ...scenario.baseline,
+          baselineCostPerMinute: projectedCostPerMinute,
+          simpleCurrentCostPerContact: projectedCostPerMinute * projectedAht,
+          currentAnnualCallVolume: projectedVolume,
+        },
       };
-      const r = computeScenarioResult(scen, supplier, componentsWithoutDR, driverOverrides);
-      const preDR = r.breakdown.totalAnnual;
-      const drCost = ((scen.drOverheadPct ?? 0) / 100) * preDR;
-      const tco = preDR + drCost;
-      const benefit = r.roi.baselineAnnualCost - tco;
-      cumNet += benefit;
-      rows.push({ year: y, volume: Math.round(vol), resolution: res, baselineCost: bl, tco, drCost, netBenefit: benefit, cumulativeNetBenefit: cumNet });
-      vol *= 1 + growth.volumePct / 100;
-      res = Math.min(0.95, res + growth.resolutionPts / 100);
-      bl *= 1 + growth.inflationPct / 100;
+
+      const projectedComponents = applyProjectionPriceChanges(
+        components,
+        growth,
+        componentForecastRates,
+        yearIndex,
+        y === 1
+      );
+      const projectedComponentsWithoutOverhead = projectedComponents.map((c) =>
+        overheadIds.includes(c.id) ? { ...c, pricing: { ...c.pricing, unitPrice: 0 } } : c
+      );
+      const preOverhead = computeScenarioResult(
+        scen,
+        supplier,
+        projectedComponentsWithoutOverhead,
+        driverOverrides
+      );
+      const projectedComponentsWithOverhead = projectedComponents.map((c) => {
+        const base = preOverhead.breakdown.totalAnnual;
+        if (c.id === "dr-overhead" && (scen.drOverheadPct ?? 0) > 0) {
+          return { ...c, pricing: { ...c.pricing, unitPrice: (base * ((scen.drOverheadPct ?? 0) / 100)) / 12 } };
+        }
+        if (c.id === "preprod-overhead" && (scen.preprodOverheadPct ?? 0) > 0) {
+          return { ...c, pricing: { ...c.pricing, unitPrice: (base * ((scen.preprodOverheadPct ?? 0) / 100)) / 12 } };
+        }
+        if (c.id === "staging-overhead" && (scen.stagingOverheadPct ?? 0) > 0) {
+          return { ...c, pricing: { ...c.pricing, unitPrice: (base * ((scen.stagingOverheadPct ?? 0) / 100)) / 12 } };
+        }
+        return c;
+      });
+
+      const r = computeScenarioResult(scen, supplier, projectedComponentsWithOverhead, driverOverrides);
+      const oneOffInvestment = y === 1 ? scen.investment : 0;
+      const totalCost = r.breakdown.totalAnnual + oneOffInvestment;
+      rows.push({
+        year: y,
+        fiscalYear,
+        label: fiscalYearLabel(fiscalYear),
+        volume: projectedVolume,
+        peakConcurrency: Math.round(r.volumes.peakConcurrentCalls),
+        baselineAnnualCost: r.roi.baselineAnnualCost,
+        totalCost,
+        costPerCall: projectedVolume > 0 ? totalCost / projectedVolume : 0,
+        yoyChangePct: 0,
+        categories: forecastCategoryCosts(r),
+      });
     }
-    return rows;
-  }, [scenario, supplier, componentsWithoutDR, driverOverrides, growth]);
+    return rows.map((row, index) => ({
+      ...row,
+      yoyChangePct:
+        index === 0 || rows[index - 1].totalCost === 0
+          ? 0
+          : ((row.totalCost - rows[index - 1].totalCost) / rows[index - 1].totalCost) * 100,
+    }));
+  }, [scenario, supplier, components, driverOverrides, growth, forecastCallOverrides, componentForecastRates, overheadIds]);
+
+  const forecastComponentOptions = useMemo(() => {
+    return result.breakdown.lines
+      .map((line) => ({
+        line,
+        component: components.find((component) => component.id === line.componentId),
+      }))
+      .filter((item) => item.component)
+      .sort((a, b) => b.line.annualCost - a.line.annualCost)
+      .slice(0, 8);
+  }, [components, result.breakdown.lines]);
 
   const handleLoadScenario = useCallback((id: string) => {
     const target = scenarios.find((s) => s.id === id);
@@ -605,77 +814,158 @@ export default function Page() {
           </>
         )}
 
-        {/* Growth curves */}
+        {/* Multi-year forecast */}
         <section className="mt-8">
           <div className="rounded-2xl border hairline bg-panel p-5">
-            <SectionLabel n="GR" title="Multi-year projection" />
+            <SectionLabel n="FC" title="Multi-year cost forecast" />
             <p className="mb-3 text-xs text-muted">
-              Compound annual growth applied to year-1 baseline. Projects TCO, net benefit, and cumulative
-              savings over multiple years.
+              Uses the current scenario as year 1, then reruns the existing cost engine for each forecast year
+              with changed call volume and pricing assumptions.
             </p>
-            <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_1fr]">
+            <div className="grid grid-cols-1 gap-6 xl:grid-cols-[0.85fr_1.15fr]">
               <div className="space-y-4">
-                <Slider
-                  label="Volume growth"
-                  description={`${growth.volumePct}% more calls each year`}
-                  min={0} max={50} step={1}
-                  value={growth.volumePct}
-                  onChange={(v) => setGrowth((g) => ({ ...g, volumePct: v }))}
-                  format={(v) => `${v}%`}
-                />
-                <Slider
-                  label="Resolution improvement"
-                  description={`+${growth.resolutionPts} percentage points per year`}
-                  min={0} max={10} step={0.5}
-                  value={growth.resolutionPts}
-                  onChange={(v) => setGrowth((g) => ({ ...g, resolutionPts: v }))}
-                  format={(v) => `+${v}pp`}
-                />
-                <Slider
-                  label="Baseline cost inflation"
-                  description={`Human cost per minute inflates ${growth.inflationPct}% per year`}
-                  min={0} max={10} step={0.5}
-                  value={growth.inflationPct}
-                  onChange={(v) => setGrowth((g) => ({ ...g, inflationPct: v }))}
-                  format={(v) => `${v}%`}
-                />
-                <Slider
-                  label="Projection years"
-                  description={`Show ${growth.years} years of projections`}
-                  min={1} max={5} step={1}
-                  value={growth.years}
-                  onChange={(v) => setGrowth((g) => ({ ...g, years: v }))}
-                  format={(v) => `${v}yr`}
-                />
-              </div>
-              <div className="overflow-hidden rounded-xl border hairline">
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="border-b hairline bg-panel2 text-left">
-                      <th className="px-3 py-2 eyebrow font-normal">Year</th>
-                      <th className="px-3 py-2 eyebrow font-normal text-right">Volume</th>
-                      <th className="px-3 py-2 eyebrow font-normal text-right">Resolution</th>
-                      <th className="px-3 py-2 eyebrow font-normal text-right">Baseline</th>
-                      <th className="px-3 py-2 eyebrow font-normal text-right">TCO</th>
-                      <th className="px-3 py-2 eyebrow font-normal text-right">Net benefit</th>
-                      <th className="px-3 py-2 eyebrow font-normal text-right">Cumulative</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {projection.map((row, i) => (
-                      <tr key={row.year} className={`border-b hairline ${i === 0 ? "bg-signal/5" : ""}`}>
-                        <td className="px-3 py-2 figure text-xs text-ink">Year {row.year}</td>
-                        <td className="px-3 py-2 text-right figure text-xs text-muted">{num(row.volume)}</td>
-                        <td className="px-3 py-2 text-right figure text-xs text-muted">{pct(row.resolution)}</td>
-                        <td className="px-3 py-2 text-right figure text-xs text-muted">£{row.baselineCost.toFixed(2)}</td>
-                        <td className="px-3 py-2 text-right figure text-xs text-ink">{gbp(row.tco, { compact: true })}</td>
-                        <td className="px-3 py-2 text-right figure text-xs text-signal">{gbp(row.netBenefit, { compact: true })}</td>
-                        <td className="px-3 py-2 text-right figure text-xs text-signal">{gbp(row.cumulativeNetBenefit, { compact: true })}</td>
-                      </tr>
+                <div className="rounded-xl border hairline bg-panel2 p-4">
+                  <div className="mb-4 text-xs font-semibold text-ink">Forecast settings</div>
+                  <div className="space-y-4">
+                    <Slider
+                      label="Forecast start year"
+                      description={`Year 1 is ${fiscalYearLabel(growth.startYear)} and uses the current scenario.`}
+                      min={2025} max={2040} step={1}
+                      value={growth.startYear}
+                      onChange={(v) => setGrowth((g) => ({ ...g, startYear: v }))}
+                      format={(v) => fiscalYearLabel(v)}
+                    />
+                    <Slider
+                      label="Number of years"
+                      description={`Show ${growth.years} forecast years`}
+                      min={1} max={7} step={1}
+                      value={growth.years}
+                      onChange={(v) => setGrowth((g) => ({ ...g, years: v }))}
+                      format={(v) => `${v}yr`}
+                    />
+                    <Slider
+                      label="Annual call volume growth"
+                      description={`${growth.volumePct}% more calls each year unless a year is overridden.`}
+                      min={-20} max={100} step={1}
+                      value={growth.volumePct}
+                      onChange={(v) => setGrowth((g) => ({ ...g, volumePct: v }))}
+                      format={(v) => `${v > 0 ? "+" : ""}${v}%`}
+                    />
+                    <Slider
+                      label="Annual cost inflation"
+                      description={`${growth.inflationPct}% default annual price change for costs without a more specific rule.`}
+                      min={-20} max={30} step={0.5}
+                      value={growth.inflationPct}
+                      onChange={(v) => setGrowth((g) => ({ ...g, inflationPct: v }))}
+                      format={(v) => `${v > 0 ? "+" : ""}${v}%`}
+                    />
+                    <Slider
+                      label="Supplier price change"
+                      description={`Optional voice supplier annual price change: ${growth.supplierPricePct}%.`}
+                      min={-30} max={30} step={0.5}
+                      value={growth.supplierPricePct}
+                      onChange={(v) => setGrowth((g) => ({ ...g, supplierPricePct: v }))}
+                      format={(v) => `${v > 0 ? "+" : ""}${v}%`}
+                    />
+                    <Slider
+                      label="Infrastructure price change"
+                      description={`Optional EC2, EKS, SageMaker, storage, egress, logging and monitoring price change.`}
+                      min={-30} max={30} step={0.5}
+                      value={growth.infrastructurePricePct}
+                      onChange={(v) => setGrowth((g) => ({ ...g, infrastructurePricePct: v }))}
+                      format={(v) => `${v > 0 ? "+" : ""}${v}%`}
+                    />
+                    <Slider
+                      label="AI / LLM price change"
+                      description={`Optional Bedrock, LLM, evaluation and knowledge/search price change.`}
+                      min={-60} max={30} step={1}
+                      value={growth.aiPricePct}
+                      onChange={(v) => setGrowth((g) => ({ ...g, aiPricePct: v }))}
+                      format={(v) => `${v > 0 ? "+" : ""}${v}%`}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setGrowth((g) => ({ ...g, concurrencyFollowsVolume: !g.concurrencyFollowsVolume }))}
+                      className={`w-full rounded-lg border px-3 py-2 text-left transition-colors ${
+                        growth.concurrencyFollowsVolume
+                          ? "border-signalDim bg-signal/10"
+                          : "hairline bg-panel"
+                      }`}
+                    >
+                      <span className="block text-xs text-muted">Peak concurrency</span>
+                      <span className="figure mt-1 block text-sm text-signal">
+                        {growth.concurrencyFollowsVolume ? "follows call growth" : "held flat"}
+                      </span>
+                    </button>
+                  </div>
+                </div>
+
+                <div className="rounded-xl border hairline bg-panel2 p-4">
+                  <div className="mb-3 text-xs font-semibold text-ink">Year call-volume overrides</div>
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    {projection.map((row) => (
+                      <label key={row.fiscalYear} className="rounded-lg border hairline bg-panel px-3 py-2">
+                        <span className="mb-1 block text-[10px] text-muted">{row.label} calls</span>
+                        <input
+                          type="number"
+                          value={forecastCallOverrides[row.fiscalYear] ?? ""}
+                          placeholder={String(row.volume)}
+                          onChange={(event) => {
+                            const value = Number(event.target.value);
+                            setForecastCallOverrides((prev) => {
+                              const next = { ...prev };
+                              if (!event.target.value || !Number.isFinite(value) || value <= 0) {
+                                delete next[row.fiscalYear];
+                              } else {
+                                next[row.fiscalYear] = value;
+                              }
+                              return next;
+                            });
+                          }}
+                          className="figure w-full bg-transparent text-sm text-ink outline-none"
+                        />
+                      </label>
                     ))}
-                  </tbody>
-                </table>
+                  </div>
+                </div>
+
+                <div className="rounded-xl border hairline bg-panel2 p-4">
+                  <div className="mb-3 text-xs font-semibold text-ink">Component-specific annual change</div>
+                  <p className="mb-3 text-[10px] leading-relaxed text-ink/90">
+                    Optional overrides for the largest current cost components. Blank uses the general/category forecast rule.
+                  </p>
+                  <div className="space-y-2">
+                    {forecastComponentOptions.map(({ line, component }) => (
+                      <label key={line.componentId} className="flex items-center justify-between gap-3 rounded-lg border hairline bg-panel px-3 py-2">
+                        <span className="min-w-0">
+                          <span className="block truncate text-[10px] text-muted">{component!.service}</span>
+                          <span className="figure text-[10px] text-faint">{gbp(line.annualCost, { compact: true })}/yr</span>
+                        </span>
+                        <input
+                          type="number"
+                          value={componentForecastRates[line.componentId] ?? ""}
+                          placeholder="auto"
+                          step={0.5}
+                          onChange={(event) => {
+                            const value = Number(event.target.value);
+                            setComponentForecastRates((prev) => {
+                              const next = { ...prev };
+                              if (!event.target.value || !Number.isFinite(value)) {
+                                delete next[line.componentId];
+                              } else {
+                                next[line.componentId] = value;
+                              }
+                              return next;
+                            });
+                          }}
+                          className="figure w-20 rounded border hairline bg-panel2 px-2 py-1 text-right text-xs text-ink outline-none"
+                        />
+                      </label>
+                    ))}
+                  </div>
+                </div>
               </div>
+              <ForecastResults projection={projection} />
             </div>
           </div>
         </section>
@@ -795,18 +1085,6 @@ export default function Page() {
             </div>
           )}
           {showBreakdown && <BreakdownTable breakdown={result.breakdown} components={componentsWithDR} onUpdateComponent={updateComponent} onDeleteComponent={deleteComponent} />}
-        </section>
-
-        {/* Cost flow diagram */}
-        <section className="mt-10">
-          <SectionLabel n="07" title="Cost flow" />
-          <p className="mb-4 max-w-3xl text-sm text-muted">
-            How cost flows from usage drivers through individual components into cost categories.
-            Hover any node or link to highlight. Changes dynamically with every parameter.
-          </p>
-          <div className="rounded-2xl border hairline bg-panel p-4">
-            <CostFlowDiagram breakdown={result.breakdown} />
-          </div>
         </section>
 
         {/* Network architecture diagram */}
@@ -1457,6 +1735,82 @@ function PresetButton({
   );
 }
 
+function ForecastResults({ projection }: { projection: ForecastProjectionRow[] }) {
+  const totalForecastCost = projection.reduce((sum, row) => sum + row.totalCost, 0);
+  const maxCost = Math.max(...projection.map((row) => row.totalCost), 1);
+
+  const valueFor = (row: ForecastProjectionRow, key: string) => {
+    if (key === "callVolume") return row.volume;
+    if (key === "totalCost") return row.totalCost;
+    if (key === "yoyChangePct") return row.yoyChangePct;
+    if (key === "costPerCall") return row.costPerCall;
+    return key in row.categories ? row.categories[key as ForecastCategoryKey] : 0;
+  };
+
+  const formatForecastValue = (value: number, kind: string) => {
+    if (kind === "number") return num(value);
+    if (kind === "percent") return value === 0 ? "-" : `${value > 0 ? "+" : ""}${value.toFixed(1)}%`;
+    if (kind === "unitMoney") return gbp(value, { decimals: 3 });
+    return gbp(value, { compact: true });
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+        <MiniMetric label="Total forecast cost" value={gbp(totalForecastCost, { compact: true })} accent="coral" />
+        <MiniMetric label="Final year calls" value={num(projection.at(-1)?.volume ?? 0)} />
+        <MiniMetric label="Final year cost/call" value={gbp(projection.at(-1)?.costPerCall ?? 0, { decimals: 3 })} />
+      </div>
+
+      <div className="rounded-xl border hairline bg-panel2 p-4">
+        <div className="mb-3 text-xs font-semibold text-ink">Total cost by year</div>
+        <div className="flex h-36 items-end gap-2">
+          {projection.map((row) => (
+            <div key={row.fiscalYear} className="flex flex-1 flex-col items-center gap-2">
+              <div
+                className="w-full rounded-t bg-signal/70"
+                style={{ height: `${Math.max(6, (row.totalCost / maxCost) * 100)}%` }}
+                title={`${row.label}: ${gbp(row.totalCost, { compact: true })}`}
+              />
+              <div className="figure text-[10px] text-faint">{row.label}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="overflow-x-auto rounded-xl border hairline">
+        <table className="min-w-full text-sm">
+          <thead>
+            <tr className="border-b hairline bg-panel2 text-left">
+              <th className="sticky left-0 bg-panel2 px-3 py-2 eyebrow font-normal">Cost</th>
+              {projection.map((row) => (
+                <th key={row.fiscalYear} className="px-3 py-2 eyebrow font-normal text-right">
+                  {row.label}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {FORECAST_COST_ROWS.map((forecastRow) => (
+              <tr key={forecastRow.key} className="border-b hairline">
+                <td className="sticky left-0 bg-panel px-3 py-2 text-xs text-ink">{forecastRow.label}</td>
+                {projection.map((row) => (
+                  <td key={`${forecastRow.key}-${row.fiscalYear}`} className="px-3 py-2 text-right figure text-xs text-muted">
+                    {formatForecastValue(valueFor(row, forecastRow.key), forecastRow.kind)}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p className="text-[10px] leading-relaxed text-ink/90">
+        Forecast uses the existing scenario and cost engine for every year. Year overrides replace automatic call-growth values.
+      </p>
+    </div>
+  );
+}
+
 function AssumptionSummary({
   scenario,
   result,
@@ -1578,16 +1932,53 @@ function exportCSV(scenario: any, result: any, projection: any[], portfolio: any
   ]));
   // Cost breakdown
   parts.push(toCsv(["Category", "Annual Cost", "Per Call"], result.breakdown.byCategory.map((c: any) => [c.category, `£${c.annualCost.toFixed(2)}`, `£${c.perCall.toFixed(4)}`])));
-  // Multi-year projection
+  // Multi-year forecast
   if (projection.length > 0) {
-    parts.push(toCsv(["Year", "Volume", "Resolution", "Baseline", "TCO", "Net Benefit", "Cumulative"],
-      projection.map((r: any) => [String(r.year), String(r.volume), `${(r.resolution*100).toFixed(0)}%`, `£${r.baselineCost.toFixed(2)}`, `£${r.tco.toFixed(2)}`, `£${r.netBenefit.toFixed(2)}`, `£${r.cumulativeNetBenefit.toFixed(2)}`])
+    parts.push(toCsv([
+      "Year",
+      "Call volume",
+      "Peak concurrency",
+      "Voice supplier",
+      "Telephony",
+      "AI / LLM",
+      "Infrastructure",
+      "Storage",
+      "Evaluation",
+      "Operations",
+      "Total cost",
+      "Cost per call",
+      "YoY cost change",
+    ],
+      projection.map((r: any) => [
+        r.label ?? String(r.year),
+        String(r.volume),
+        String(r.peakConcurrency),
+        `£${(r.categories?.voiceSupplier ?? 0).toFixed(2)}`,
+        `£${(r.categories?.telephony ?? 0).toFixed(2)}`,
+        `£${(r.categories?.aiLlm ?? 0).toFixed(2)}`,
+        `£${(r.categories?.infrastructure ?? 0).toFixed(2)}`,
+        `£${(r.categories?.storage ?? 0).toFixed(2)}`,
+        `£${(r.categories?.evaluation ?? 0).toFixed(2)}`,
+        `£${(r.categories?.operations ?? 0).toFixed(2)}`,
+        `£${r.totalCost.toFixed(2)}`,
+        `£${r.costPerCall.toFixed(4)}`,
+        `${r.yoyChangePct.toFixed(1)}%`,
+      ])
     ));
   }
   // Portfolio
   if (portfolio.length > 0 && portfolioProjections.length > 0) {
-    parts.push(toCsv(["Customer", "Year", "Volume", "TCO"],
-      portfolioProjections.flatMap((p: any) => p.customers.map((c: any) => [c.customer.name, String(p.year), String(c.volume), `£${c.tco.toFixed(2)}`]))
+    parts.push(toCsv(["Customer", "Year", "Volume", "Peak Concurrency", "DR Cost", "TCO"],
+      portfolioProjections.flatMap((p: any) =>
+        p.customers.map((c: any) => [
+          c.customer.name,
+          p.label ?? String(p.year),
+          String(c.volume),
+          String(c.peakConcurrency ?? 0),
+          `£${c.drCost.toFixed(2)}`,
+          `£${c.tco.toFixed(2)}`,
+        ])
+      )
     ));
   }
   downloadCSV(`ai-cost-model-${new Date().toISOString().slice(0,10)}.csv`, parts.join("\n\n"));
@@ -1626,6 +2017,116 @@ function requiredPeakUnits(component: CostComponent | undefined, peakConcurrency
   const calculatedUnits = scaling.manualUnits ?? Math.ceil(peakConcurrency / capacityPerUnit);
   const unitsWithMinimum = Math.max(scaling.minUnits, calculatedUnits);
   return scaling.maxUnits == null ? unitsWithMinimum : Math.min(scaling.maxUnits, unitsWithMinimum);
+}
+
+function projectionFactor(percent: number, yearIndex: number): number {
+  return Math.pow(1 + percent / 100, yearIndex);
+}
+
+function fiscalYearLabel(year: number): string {
+  return `FY${String(year).slice(-2)}`;
+}
+
+function scaleConcurrencyProfileByFactor(profile: number[], factor: number): number[] {
+  return profile.map((value) => Math.max(1, Math.round(value * factor)));
+}
+
+function applyProjectionPriceChanges(
+  components: CostComponent[],
+  settings: ProjectionSettings,
+  componentRates: Record<string, number>,
+  yearIndex: number,
+  includeOneOff: boolean
+): CostComponent[] {
+  return components.map((component) => {
+    const annualChangePct =
+      componentRates[component.id] ??
+      defaultProjectionRateForComponent(component, settings);
+    const factor = projectionFactor(annualChangePct, yearIndex);
+
+    const unitPrice =
+      component.classification === "ONE_OFF" && !includeOneOff
+        ? 0
+        : component.pricing.unitPrice * factor;
+
+    return {
+      ...component,
+      pricing: {
+        ...component.pricing,
+        unitPrice,
+        inputUnitPrice:
+          component.pricing.inputUnitPrice == null
+            ? undefined
+            : component.pricing.inputUnitPrice * factor,
+        outputUnitPrice:
+          component.pricing.outputUnitPrice == null
+            ? undefined
+            : component.pricing.outputUnitPrice * factor,
+        tiers: component.pricing.tiers?.map((tier) => ({
+          ...tier,
+          unitPrice: tier.unitPrice * factor,
+        })),
+        scaling: component.pricing.scaling ? { ...component.pricing.scaling } : undefined,
+      },
+    };
+  });
+}
+
+function defaultProjectionRateForComponent(
+  component: CostComponent,
+  settings: ProjectionSettings
+): number {
+  if (component.category === "VOICE_SERVICE") return settings.supplierPricePct;
+  if (isTokenCost(component) || component.category === "KNOWLEDGE") return settings.aiPricePct;
+  if (isInfrastructureCost(component)) return settings.infrastructurePricePct;
+  return settings.inflationPct;
+}
+
+function isInfrastructureCost(component: CostComponent): boolean {
+  return (
+    component.category === "AI_AND_COMPUTE" ||
+    component.category === "TELEPHONY_AND_INTEGRATION" ||
+    component.category === "AUDIO_TRANSCRIPT_STORAGE" ||
+    component.category === "OPERATIONS_AND_OBSERVABILITY" ||
+    component.category === "DATA_AND_ANALYTICS"
+  );
+}
+
+function isTokenCost(component: CostComponent): boolean {
+  return (
+    component.pricing.model === "INPUT_OUTPUT_TOKENS" ||
+    component.pricing.model === "PER_TOKEN" ||
+    component.pricing.model === "PER_1000_TOKENS" ||
+    component.pricing.model === "PER_1000000_TOKENS" ||
+    component.id === "bedrock-llm-io" ||
+    component.id === "eval-llm"
+  );
+}
+
+function forecastCategoryCosts(r: ReturnType<typeof computeScenarioResult>) {
+  const byCategory = (category: string) => categoryCost(r, category);
+  const lineCost = (ids: string[]) =>
+    r.breakdown.lines
+      .filter((line) => ids.includes(line.componentId))
+      .reduce((sum, line) => sum + line.annualCost, 0);
+  const llmTokens = lineCost(["bedrock-llm-io", "eval-llm"]);
+  const aiLlm = llmTokens + byCategory("KNOWLEDGE");
+  const infrastructure = byCategory("AI_AND_COMPUTE") - lineCost(["bedrock-llm-io"]);
+  const operations =
+    byCategory("FIXED_OPERATIONAL") +
+    byCategory("HUMAN_ESCALATION") +
+    byCategory("OPERATIONS_AND_OBSERVABILITY") +
+    byCategory("DATA_AND_ANALYTICS");
+
+  return {
+    voiceSupplier: byCategory("VOICE_SERVICE"),
+    telephony: byCategory("TELEPHONY_AND_INTEGRATION"),
+    aiLlm,
+    infrastructure: Math.max(0, infrastructure),
+    storage: byCategory("AUDIO_TRANSCRIPT_STORAGE"),
+    evaluation: byCategory("EVALUATION_AND_ASSURANCE"),
+    operations,
+  };
 }
 
 function categoryCost(r: ReturnType<typeof computeScenarioResult>, cat: string): number {

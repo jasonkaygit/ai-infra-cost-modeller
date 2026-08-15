@@ -1,30 +1,26 @@
 "use client";
 
-import React, { useMemo } from "react";
-import type { Customer, Scenario, CostCategory } from "../../domain/types";
-import { COST_CATEGORY_LABELS, WATERFALL_ORDER } from "../../domain/types";
+import React from "react";
+import type { Customer } from "../../domain/types";
 import { gbp, num, pct } from "../format";
-import { computeScenarioResult } from "../../engine/scenario";
-
-const CAT_COLORS: Record<string, string> = {
-  VOICE_SERVICE: "#38E1B0",
-  AI_AND_COMPUTE: "#5CD0E8",
-  TELEPHONY_AND_INTEGRATION: "#8B9DCC",
-  KNOWLEDGE: "#C4A6FF",
-  AUDIO_TRANSCRIPT_STORAGE: "#FFB347",
-  EVALUATION_AND_ASSURANCE: "#FF6B8A",
-  OPERATIONS_AND_OBSERVABILITY: "#F0E68C",
-  DATA_AND_ANALYTICS: "#FF9F7B",
-  HUMAN_ESCALATION: "#C084FC",
-  FIXED_OPERATIONAL: "#94A3B8",
-};
 
 interface ProjectionYear {
   year: number;
-  customers: { customer: Customer; volume: number; resolution: number; baselineCost: number; tco: number; drCost: number }[];
+  fiscalYear: number;
+  label: string;
+  customers: {
+    customer: Customer;
+    volume: number;
+    resolution: number;
+    baselineCost: number;
+    tco: number;
+    drCost: number;
+    peakConcurrency: number;
+  }[];
   totalTCO: number;
   totalDR: number;
   totalBenefit: number;
+  totalPeakConcurrency: number;
 }
 
 export function PortfolioView({
@@ -33,7 +29,7 @@ export function PortfolioView({
   portfolioProjections,
 }: {
   combinedPeak: number;
-  growth: { volumePct: number; resolutionPts: number; inflationPct: number; years: number };
+  growth: { years: number };
   portfolioProjections: ProjectionYear[];
 }) {
   const [selectedYear, setSelectedYear] = React.useState(1);
@@ -49,8 +45,12 @@ export function PortfolioView({
   const projBenefit = selectedYear === 0
     ? portfolioProjections.reduce((s, p) => s + p.totalBenefit, 0)
     : proj?.totalBenefit ?? 0;
-  const projCalls = proj?.customers.reduce((s, c) => s + c.volume, 0) ?? 0;
-  const projPeak = Math.round(combinedPeak * Math.pow(1 + growth.volumePct / 100, (proj?.year ?? 1) - 1));
+  const projCalls = selectedYear === 0
+    ? portfolioProjections.reduce((sum, p) => sum + p.customers.reduce((s, c) => s + c.volume, 0), 0)
+    : proj?.customers.reduce((s, c) => s + c.volume, 0) ?? 0;
+  const projPeak = selectedYear === 0
+    ? portfolioProjections.reduce((peak, p) => Math.max(peak, p.totalPeakConcurrency), combinedPeak)
+    : proj?.totalPeakConcurrency ?? combinedPeak;
   const displayCustomers = selectedYear === 0
     ? (() => {
         const map = new Map<string, { customer: Customer; volume: number; tco: number; drCost: number; resolution: number; baselineCost: number }>();
@@ -70,15 +70,6 @@ export function PortfolioView({
       })()
     : (proj?.customers ?? []);
 
-  const catTotals = useMemo(() => {
-    if (!proj) return [];
-    const map = new Map<CostCategory, number>();
-    for (const c of proj.customers) {
-      // Approximate category breakdown by scaling from year-1 proportions
-    }
-    return [];
-  }, [proj]);
-
   if (portfolioProjections.length === 0) {
     return (
       <p className="text-sm text-muted">
@@ -91,7 +82,7 @@ export function PortfolioView({
     <div className="space-y-6">
       {/* Year selector */}
       <div className="flex items-center gap-2">
-        <span className="text-xs text-muted">Projection year:</span>
+        <span className="text-xs text-muted">Forecast year:</span>
         {portfolioProjections.map((p) => (
           <button
             key={p.year}
@@ -100,7 +91,7 @@ export function PortfolioView({
               selectedYear === p.year ? "bg-signal text-ground" : "border hairline text-muted hover:text-ink"
             }`}
           >
-            Year {p.year}
+            {p.label}
           </button>
         ))}
         <button
@@ -154,7 +145,7 @@ export function PortfolioView({
       {displayCustomers.length > 0 && (
         <div>
           <div className="eyebrow mb-2 text-[10px]">
-            Per-customer breakdown — {selectedYear === 0 ? `All years (total)` : `Year ${selectedYear}`}
+            Per-customer breakdown — {selectedYear === 0 ? `All years (total)` : proj?.label ?? `Year ${selectedYear}`}
           </div>
           <div className="overflow-hidden rounded-xl border hairline">
             <table className="w-full text-sm">
@@ -212,4 +203,3 @@ function AggMetric({ label, value, accent }: { label: string; value: string; acc
     </div>
   );
 }
-
